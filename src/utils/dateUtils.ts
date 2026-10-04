@@ -116,32 +116,6 @@ export function combineDateAndTime(dateStr?: string | null, timeStr?: string | n
   return ddmmyyyy;
 }
 
-export function isNewAddedInLast24Hours(show: {
-  createdTimestamp?: number;
-  sessionAddedAt?: number;
-  dateAdded?: string;
-}): boolean {
-  if (!show) return false;
-  const TWENTY_FOUR_HOURS_MS = 24 * 60 * 60 * 1000;
-  const now = Date.now();
-
-  if (show.createdTimestamp) {
-    const diff = now - show.createdTimestamp;
-    if (diff >= 0 && diff <= TWENTY_FOUR_HOURS_MS) return true;
-  }
-
-  if (show.sessionAddedAt) {
-    const diff = now - show.sessionAddedAt;
-    if (diff >= 0 && diff <= TWENTY_FOUR_HOURS_MS) return true;
-  }
-
-  if (show.dateAdded) {
-    const parsed = parseAnyDate(show.dateAdded);
-    if (parsed) {
-      const diff = now - parsed.getTime();
-      if (diff >= 0 && diff <= TWENTY_FOUR_HOURS_MS) return true;
-    }
-  }
-
-  return false;
-}
+/* 
+ * Helper functions for date parsing and formatting.
+ */

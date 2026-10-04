@@ -5,7 +5,7 @@ import { motion, AnimatePresence } from 'motion/react';
 import { ShowItem } from '../types';
 import { getOptimizedPoster } from '../utils/imageOptimizer';
 import { getOrFetchImdbUrl } from '../services/posterService';
-import { formatToDDMMYYYY, isNewAddedInLast24Hours } from '../utils/dateUtils';
+import { formatToDDMMYYYY } from '../utils/dateUtils';
 import { calculateShowProgress } from '../utils/showMetrics';
 import { isShowOutNow, isFutureRelease, parseReleaseDateToTimestamp, isReleaseDatePast } from '../services/notificationService';
 import { useNotificationContext } from '../context/NotificationContext';
@@ -270,11 +270,6 @@ export default function NetflixHoverPortal({
     [show.priority, show.isWishlist]
   );
 
-  const isRecentlyAdded = useMemo(
-    () => isNewAddedInLast24Hours(show),
-    [show]
-  );
-
   // Calculate high match score dynamically based on title characters & ratings for realism
   const matchScore = useMemo(() => {
     const code = show.title.charCodeAt(0) || 75;
@@ -391,16 +386,6 @@ export default function NetflixHoverPortal({
                 <span className="text-[10px] font-bold px-1.5 py-0.5 rounded bg-black/75 text-zinc-200 backdrop-blur-sm border border-zinc-700/50 shadow-md">
                   {show.platform}
                 </span>
-                {isRecentlyAdded && (
-                  <span
-                    className="text-[9px] font-black uppercase tracking-wider px-2 py-0.5 rounded text-white border border-red-400 shadow-lg shadow-black/80 shrink-0 flex items-center gap-1 animate-pulse"
-                    style={{ backgroundColor: '#E50914', color: '#ffffff', borderColor: '#ff4d4d' }}
-                    title="New show added within the last 24 hours"
-                  >
-                    <Sparkles className="w-2.5 h-2.5 text-yellow-300 shrink-0" />
-                    <span>NEW</span>
-                  </span>
-                )}
               </div>
               {(show.isWishlist || priorityIndicator) && (
                 <div className="flex items-center gap-1 flex-wrap">

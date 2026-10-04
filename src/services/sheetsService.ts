@@ -1439,6 +1439,9 @@ export function buildRowValues(show: ShowItem, headers: string[]): string[] {
       case 'release_note':
         values.push(show.releaseNote || '');
         break;
+      case 'date_added':
+        values.push(parseGoogleSheetsDate(show.dateAdded) || show.dateAdded || '');
+        break;
       default:
         values.push('');
         break;

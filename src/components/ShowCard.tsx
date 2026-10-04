@@ -2,7 +2,7 @@ import { useState, useRef, useEffect } from 'react';
 import { Bell, BellRing, Sparkles } from 'lucide-react';
 import { ShowItem } from '../types';
 import { getOptimizedPoster } from '../utils/imageOptimizer';
-import { formatToDDMMYYYY, isNewAddedInLast24Hours } from '../utils/dateUtils';
+import { formatToDDMMYYYY } from '../utils/dateUtils';
 import { calculateShowProgress } from '../utils/showMetrics';
 import { isNotificationEnabled, toggleShowNotification, isShowOutNow, isFutureRelease, isReleaseDatePast } from '../services/notificationService';
 import { fetchLiveTvMazeInfo, TvMazeEpisode } from '../services/tvMazeService';
@@ -219,7 +219,6 @@ export default function ShowCard({
 
   // Visually display all Priority indicator types (🔴 High, 🟡 Medium, 🟢 Low, or custom)
   const priorityIndicator = getPriorityIndicator(show.priority, show.isWishlist);
-  const isRecentlyAdded = isNewAddedInLast24Hours(show);
 
   return (
     <div
@@ -267,16 +266,6 @@ export default function ShowCard({
               <span className="text-[10px] font-bold px-1.5 py-0.5 rounded bg-black/75 text-zinc-200 backdrop-blur-sm border border-zinc-700/50 truncate max-w-full">
                 {show.platform}
               </span>
-              {isRecentlyAdded && (
-                <span
-                  className="text-[9px] font-black uppercase tracking-wider px-2 py-0.5 rounded text-white border border-red-400 shadow-lg shadow-black/80 shrink-0 flex items-center gap-1 animate-pulse"
-                  style={{ backgroundColor: '#E50914', color: '#ffffff', borderColor: '#ff4d4d' }}
-                  title="New show added within the last 24 hours"
-                >
-                  <Sparkles className="w-2.5 h-2.5 text-yellow-300 shrink-0" />
-                  <span>NEW</span>
-                </span>
-              )}
             </div>
             {(show.isWishlist || priorityIndicator) && (
               <div className="flex items-center gap-1 flex-nowrap max-w-full">

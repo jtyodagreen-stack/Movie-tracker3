@@ -20,6 +20,7 @@ import {
   WifiOff,
   Bell,
   Search,
+  Unlink,
 } from 'lucide-react';
 import toast from 'react-hot-toast';
 import type { User as FirebaseUser } from 'firebase/auth';
@@ -526,7 +527,7 @@ export default function SettingsCenterModal({
   return (
     <div
       id="settings-center-modal-backdrop"
-      className="fixed inset-0 z-50 flex items-center justify-center p-2 sm:p-4 bg-black/85 backdrop-blur-md"
+      className="fixed inset-0 z-[60] flex items-center justify-center p-2 sm:p-4 bg-black/85 backdrop-blur-md"
       onClick={onClose}
     >
       <div
@@ -1036,34 +1037,42 @@ export default function SettingsCenterModal({
                   {isConnected ? (
                     <>
                       <button
+                        id="btn-force-re-sync"
                         type="button"
                         onClick={handleSyncNow}
                         disabled={isSyncing}
                         className="bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs px-3.5 py-2 rounded-lg transition-all shadow-md cursor-pointer flex items-center gap-1.5 hover:scale-105 active:scale-95 disabled:opacity-50"
+                        title="Pull fresh data from Google Sheet now"
                       >
                         <RefreshCw className={`w-3.5 h-3.5 ${isSyncing ? 'animate-spin' : ''}`} />
                         <span>{isSyncing ? 'Syncing...' : 'Force Re-Sync'}</span>
                       </button>
 
                       <button
+                        id="btn-reconnect-google"
                         type="button"
                         onClick={handleReconnectGoogleAccount}
-                        className="bg-amber-600/30 hover:bg-amber-600/50 text-amber-300 border border-amber-500/40 font-bold text-xs px-3 py-2 rounded-lg transition-all cursor-pointer flex items-center gap-1.5 hover:scale-105 active:scale-95"
-                        title="Re-authorize Google OAuth if connection expired"
+                        className="bg-amber-600/30 hover:bg-amber-600/50 text-amber-300 border border-amber-500/40 font-bold text-xs px-3 py-2 rounded-lg transition-all cursor-pointer flex items-center gap-1.5 hover:scale-105 active:scale-95 focus:ring-2 focus:ring-amber-400 focus:outline-none"
+                        title="Full re-authorization when you tap"
                       >
                         <Sparkles className="w-3.5 h-3.5 text-amber-400" />
                         <span>Reconnect</span>
                       </button>
 
                       <button
+                        id="btn-disconnect-sheet"
                         type="button"
                         onClick={() => {
-                          onDisconnect();
-                          toast.success('Disconnected from Google Sheet', { duration: 5000 });
+                          if (window.confirm('Are you sure you want to disconnect this Google Sheet? You can reconnect anytime.')) {
+                            onDisconnect();
+                            toast.success('Disconnected from Google Sheet', { duration: 5000 });
+                          }
                         }}
-                        className="bg-red-950 hover:bg-red-900 text-red-300 border border-red-800/40 text-xs font-bold px-3 py-2 rounded-lg preserve-theme-color cursor-pointer"
+                        className="bg-red-950 hover:bg-red-900 text-red-300 border border-red-800/40 text-xs font-bold px-3 py-2 rounded-lg preserve-theme-color cursor-pointer flex items-center gap-1.5 hover:scale-105 active:scale-95"
+                        title="Unlink spreadsheet with confirmation"
                       >
-                        Disconnect
+                        <Unlink className="w-3.5 h-3.5 text-red-400" />
+                        <span>Disconnect</span>
                       </button>
                     </>
                   ) : (
@@ -1112,35 +1121,13 @@ export default function SettingsCenterModal({
                 {errorMsg && <p className="text-red-400 text-xs font-medium">{errorMsg}</p>}
               </div>
 
-              {/* Auto Sync Timer frequency */}
-              {onUpdateSyncFrequency && (
-                <div className="space-y-2 pt-2 border-t border-zinc-900">
-                  <div className="flex items-center justify-between">
-                    <div>
-                      <span className="text-xs font-bold text-zinc-300 uppercase tracking-wider block">⏱️ Auto-Sync Interval</span>
-                      <p className="text-[11px] text-zinc-500">Change background automated fetch timer interval speed.</p>
-                    </div>
-                    <span className="text-xs font-bold font-mono text-white">{syncFrequency >= 60 ? `${syncFrequency / 60} minutes` : `${syncFrequency} seconds`}</span>
-                  </div>
-
-                  <div className="flex gap-2 flex-wrap">
-                    {[15, 30, 45, 60, 180, 300].map((sec) => (
-                      <button
-                        key={sec}
-                        type="button"
-                        onClick={() => onUpdateSyncFrequency(sec)}
-                        className={`px-3 py-1.5 rounded-lg text-xs font-mono font-bold border transition-colors ${
-                          syncFrequency === sec
-                            ? 'bg-emerald-500 text-white border-emerald-400'
-                            : 'bg-zinc-900 text-zinc-400 border-zinc-900 hover:bg-zinc-800'
-                        }`}
-                      >
-                        {sec >= 60 ? `${sec / 60}m` : `${sec}s`}
-                      </button>
-                    ))}
-                  </div>
-                </div>
-              )}
+              {/* Live Sync Model Information */}
+              <div className="pt-2 border-t border-zinc-900 text-xs text-zinc-400 space-y-1">
+                <span className="text-[10px] font-bold text-zinc-500 uppercase tracking-wider block">⚡ Live Sync Model</span>
+                <p className="text-zinc-400 text-[11px] leading-relaxed">
+                  ShowFlix syncs directly with your Google Sheet on page open, whenever you return to this tab, or when you tap <strong>Force Re-Sync</strong>.
+                </p>
+              </div>
             </div>
           )}
 

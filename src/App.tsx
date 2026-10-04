@@ -12,6 +12,12 @@ import {
   saveUserSheetConfig,
   loadUserSheetConfig,
   googleFetch as fetch,
+  db,
+  onSnapshot,
+  doc,
+  setDoc,
+  serverTimestamp,
+  collection,
 } from './firebase';
 import { ShowItem, WatchStatus, PRESET_PLATFORMS, AccessibilitySettings, AlertIntervals } from './types';
 import { DEFAULT_PROFILE_USER } from './utils/userProfile';
@@ -71,8 +77,14 @@ import {
 } from './services/notificationService';
 import { OfflineIndicator } from './components/OfflineIndicator';
 import { getViewerColor } from './utils/profileColors';
-import { getAppDataCache, setAppDataCache, queueOfflineAction } from './services/offlineQueue';
-import { calculateShowProgress } from './utils/showMetrics';
+import {
+  getAppDataCache,
+  setAppDataCache,
+  queueOfflineAction,
+  getOfflineQueue,
+  clearOfflineQueue,
+} from './services/offlineQueue';
+import { calculateShowProgress, compareByAddedRank, compareRecentlyAdded, rebuildSheetAddedRanks } from './utils/showMetrics';
 import { parseAnyDate, getTodayDDMMYYYY } from './utils/dateUtils';
 import { PieChart, Pie, Cell, ResponsiveContainer } from 'recharts';
 
@@ -111,7 +123,14 @@ function haveShowsChanged(oldShows: ShowItem[], newShows: ShowItem[]): boolean {
       o.platform !== n.platform ||
       o.genre !== n.genre ||
       o.type !== n.type ||
-      o.rowNumber !== n.rowNumber
+      o.rowNumber !== n.rowNumber ||
+      o.isWishlist !== n.isWishlist ||
+      o.sheetTabName !== n.sheetTabName ||
+      o.posterUrl !== n.posterUrl ||
+      o.releaseDate !== n.releaseDate ||
+      o.releaseNote !== n.releaseNote ||
+      o.year !== n.year ||
+      o.priority !== n.priority
     ) {
       return true;
     }
@@ -132,7 +151,7 @@ export default function App() {
         return [];
       }
       if (cache?.shows && cache.shows.length > 0) {
-        return cache.shows;
+        return rebuildSheetAddedRanks(cache.shows).sort(compareByAddedRank);
       }
     } catch {}
     return [];
@@ -146,7 +165,8 @@ export default function App() {
     });
   }, [shows]);
 
-  const showsRef = useRef<ShowItem[]>([]);
+  const showsRef = useRef<ShowItem[]>(shows);
+  showsRef.current = shows;
   useEffect(() => {
     showsRef.current = shows;
   }, [shows]);
@@ -170,18 +190,6 @@ export default function App() {
     document.documentElement.style.overflowX = 'hidden';
   }, []);
 
-  const handleSyncOfflineQueue = async (queue: any[]) => {
-    for (const action of queue) {
-      try {
-        if (action.payload) {
-          await syncShowToSheet(action.payload);
-        }
-      } catch (e) {
-        console.error('Failed to sync offline action:', action, e);
-      }
-    }
-    showToast('✨ All offline changes successfully synced to Google Sheets!');
-  };
   const [searchQuery, setSearchQuery] = useState('');
   const [activeFilter, setActiveFilter] = useState('all');
   const [customPlatforms] = useState<string[]>([]);
@@ -234,7 +242,7 @@ export default function App() {
   }, [accessibilitySettings.accentColor]);
   const [selectedPlatform, setSelectedPlatform] = useState('all');
   const [selectedYear, setSelectedYear] = useState('all');
-  const [sortOrder, setSortOrder] = useState('title-asc');
+  const [sortOrder, setSortOrder] = useState('recently-added');
   const [selectedShow, setSelectedShow] = useState<ShowItem | null>(null);
 
   const [hoveredShowId, setHoveredShowId] = useState<string | null>(null);
@@ -296,14 +304,21 @@ export default function App() {
   const [showDecisionWheelModal, setShowDecisionWheelModal] = useState(false);
   const [showScrollTop, setShowScrollTop] = useState(false);
 
-  const handleOpenSettingsModal = (
+  const handleOpenSettingsModal = useCallback((
     tab: 'all' | 'user' | 'sync' | 'acc' | 'theme' | 'data' | 'help' | 'alerts' | 'stats' = 'sync',
     subSection: 'guide' | 'bug' | 'feedback' | 'support' = 'guide'
   ) => {
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(new CustomEvent('close-mobile-menu'));
+    }
+    setSelectedShow(null);
+    setShowAddModal(false);
+    setShowDecisionWheelModal(false);
+    setShowStatsModal(false);
     setSettingsModalTab(tab);
     setSettingsModalHelpSubSection(subSection);
     setShowSyncModal(true);
-  };
+  }, []);
 
   // Track window scroll position for Back to Top
   useEffect(() => {
@@ -461,11 +476,39 @@ export default function App() {
   const [isOnline, setIsOnline] = useState<boolean>(() =>
     typeof navigator !== 'undefined' ? navigator.onLine : true
   );
+  const lastRemoteSyncRef = useRef<number>(0);
+  const syncGoogleSheetRef = useRef<((trigger: 'first_open' | 'return' | 'force') => Promise<void>) | null>(null);
+
+  useEffect(() => {
+    if (!db) return;
+    const syncDoc = doc(db, 'sync-control', 'global');
+    return onSnapshot(syncDoc, (snap) => {
+      const data = snap.data();
+      if (data && data.lastUpdated > lastRemoteSyncRef.current) {
+        lastRemoteSyncRef.current = data.lastUpdated;
+        if (syncGoogleSheetRef.current) {
+          syncGoogleSheetRef.current('force');
+        }
+      }
+    });
+  }, []);
+
+  const updateRemoteSync = async () => {
+    if (!db) return;
+    try {
+      await setDoc(doc(db, 'sync-control', 'global'), { lastUpdated: Date.now() });
+    } catch (e) {
+      console.error('Failed to trigger remote sync:', e);
+    }
+  };
 
   useEffect(() => {
     const handleOnline = () => {
       setIsOnline(true);
-      showToast('🌐 Internet connection restored');
+      showToast('🌐 Internet restored — syncing with Google Sheet...');
+      if (syncGoogleSheetRef.current) {
+        syncGoogleSheetRef.current('force');
+      }
     };
     const handleOffline = () => {
       setIsOnline(false);
@@ -668,8 +711,14 @@ export default function App() {
   const showToast = useCallback((msg: string) => {
     if (!msg) return;
     const now = Date.now();
-    // 1. Anti-duplicate check: ignore exact same message if triggered within 2000ms
-    if (lastToastRef.current && lastToastRef.current.text === msg && now - lastToastRef.current.time < 2000) {
+    // 1. Anti-duplicate check: ignore exact same message if triggered within 2000ms (except checking and up to date)
+    if (
+      lastToastRef.current &&
+      lastToastRef.current.text === msg &&
+      now - lastToastRef.current.time < 2000 &&
+      msg !== 'Checking...' &&
+      msg !== 'Up to date'
+    ) {
       return;
     }
     lastToastRef.current = { text: msg, time: now };
@@ -679,46 +728,235 @@ export default function App() {
 
     // 3. Render new toast cleanly with single ID
     toast(msg, { id: 'app-global-toast', duration: 3500 });
-  }, []);
 
-  // Reusable simple sync from Google Sheets (No automatic popups or forced reconnect loops)
-  const fetchLatestFromSheet = useCallback(
-    async (mode: 'initial' | 'manual' | 'background' | 'return' | boolean = 'background') => {
-      const isInitial = mode === 'initial';
-      const isManual = mode === 'manual' || mode === false;
-      const isReturn = mode === 'return';
-      const isBackground = mode === 'background' || mode === true;
+    // When "Session expired" toast shows → auto-open Settings Modal instantly and jump to Google Sheets section (mobile & desktop)
+    if (msg.toLowerCase().includes('session expired') || msg.toLowerCase().includes('session-expired')) {
+      handleOpenSettingsModal('sync');
+    }
+  }, [handleOpenSettingsModal]);
 
-      // Rule 1: Offline check
-      if (!navigator.onLine || !isOnline) {
-        if (isInitial || isManual) {
-          showToast('🔌 Offline');
-        }
+  // Helper: auto-sync updated show to Google Sheet (reliable non-blocking live update with offline queue)
+  const syncShowToSheet = useCallback(async (updatedShow: ShowItem, isExplicitSave = false) => {
+    if (!navigator.onLine) {
+      queueOfflineAction('UPDATE_SHOW', updatedShow);
+      showToast(`📴 Offline: "${updatedShow.title}" updated locally — will sync when online`);
+      return;
+    }
+
+    if (!spreadsheetId) {
+      setShowSyncModal(true);
+      showToast('⚠️ Connect your Google Sheet to enable live sync');
+      return;
+    }
+
+    const targetTab = updatedShow.sheetTabName || (updatedShow.isWishlist ? wishlistSheetName : sheetName);
+    let rowNum = updatedShow.rowNumber;
+    let currentHeaders = updatedShow.isWishlist ? DEFAULT_WISHLIST_HEADERS : sheetHeaders;
+
+    try {
+      let token = await getAccessToken();
+      if (!token && auth.currentUser) {
+        token = await getAccessToken();
+      }
+
+      if (!token) {
+        setCachedAccessToken(null);
+        showToast('⚠️ Google Sheets session expired. Please reconnect.');
+        handleOpenSettingsModal('sync');
         return;
       }
 
-      // Rule 5: Wi-Fi setting check
-      if (isBackground && syncOnlyOnWifi) {
-        const conn = (navigator as any).connection;
-        const isCellular =
-          conn?.type === 'cellular' ||
-          conn?.effectiveType === '2g' ||
-          conn?.effectiveType === '3g' ||
-          conn?.effectiveType === '4g';
-        if (isCellular) {
-          return;
+      const liveHeaders = await getSheetTabHeaders(spreadsheetId, targetTab, token);
+      if (liveHeaders && liveHeaders.length > 0) {
+        currentHeaders = liveHeaders;
+      }
+
+      if (!updatedShow.isWishlist && updatedShow.posterUrl && !currentHeaders.some((h, i) => h.toLowerCase().includes('poster') || h.toLowerCase().includes('image') || i === 15)) {
+        try {
+          const colRes = await ensurePosterColumnInSheet(spreadsheetId, targetTab, currentHeaders, token);
+          if (colRes.wasAdded) {
+            currentHeaders = colRes.headers;
+            setSheetHeaders(currentHeaders);
+            try {
+              localStorage.setItem('bingebox_sheet_headers', JSON.stringify(currentHeaders));
+            } catch {}
+          }
+        } catch (e) {
+          console.warn('Could not auto-add poster column:', e);
         }
       }
 
-      const currentSheetId = spreadsheetId || localStorage.getItem('bingebox_spreadsheet_id');
-      const currentSheetName = sheetName || localStorage.getItem('bingebox_sheet_name') || 'MASTER TRACKER';
-      const currentWishlistName = wishlistSheetName || localStorage.getItem('bingebox_wishlist_sheet_name') || 'Wishlist';
-      const currentShowcaseName = showcaseSheetName || localStorage.getItem('bingebox_showcase_sheet_name') || 'SHOWCASE';
+      if (updatedShow.isWishlist) {
+        try {
+          const tabRes = await ensureSheetTabExists(spreadsheetId, targetTab, DEFAULT_WISHLIST_HEADERS, token);
+          if (tabRes.actualTitle && tabRes.actualTitle !== targetTab) {
+            updatedShow.sheetTabName = tabRes.actualTitle;
+          }
+        } catch (tabErr) {
+          console.warn('Ensure wishlist tab in syncShowToSheet:', tabErr);
+        }
+      }
+
+      if (!rowNum) {
+        rowNum = (await findRowNumberByTitle(spreadsheetId, targetTab, updatedShow.title, token)) ?? undefined;
+      }
+
+      if (!isExplicitSave) {
+        const existingShow = shows.find(
+          (s) =>
+            s.id === updatedShow.id ||
+            (s.title && updatedShow.title && s.title.toLowerCase().trim() === updatedShow.title.toLowerCase().trim())
+        );
+
+        let verifiedReleaseDate = updatedShow.releaseDate?.trim();
+        let verifiedReleaseNote = updatedShow.releaseNote?.trim();
+
+        if (!verifiedReleaseDate && existingShow?.releaseDate?.trim()) {
+          verifiedReleaseDate = existingShow.releaseDate.trim();
+        }
+        if (!verifiedReleaseNote && existingShow?.releaseNote?.trim()) {
+          verifiedReleaseNote = existingShow.releaseNote.trim();
+        }
+
+        updatedShow.releaseDate = verifiedReleaseDate || undefined;
+        updatedShow.releaseNote = verifiedReleaseNote || undefined;
+      }
+
+      if (!rowNum) {
+        const appendRes = await appendSheetRow(spreadsheetId, targetTab, updatedShow, currentHeaders, token);
+        rowNum = appendRes.rowNumber;
+        if (rowNum) {
+          updatedShow.rowNumber = rowNum;
+          setShows((prev) =>
+            prev.map((s) =>
+              s.id === updatedShow.id
+                ? { ...s, rowNumber: rowNum, sheetTabName: targetTab, releaseDate: updatedShow.releaseDate, releaseNote: updatedShow.releaseNote }
+                : s
+            )
+          );
+        }
+        showToast(`✅ Synced "${updatedShow.title}" to "${targetTab}"!`);
+        return;
+      }
+
+      await updateSheetRow(
+        spreadsheetId,
+        targetTab,
+        rowNum,
+        updatedShow,
+        currentHeaders,
+        token
+      );
+
+      setShows((prev) =>
+        prev.map((s) =>
+          s.id === updatedShow.id
+            ? { ...s, rowNumber: rowNum, sheetTabName: targetTab, releaseDate: updatedShow.releaseDate, releaseNote: updatedShow.releaseNote }
+            : s
+        )
+      );
+
+      showToast(`✅ Google Sheet Updated: "${updatedShow.title}" (${targetTab})`);
+    } catch (err: any) {
+      console.error('Failed to sync show to Google Sheets:', err);
+      const msg = err?.message || String(err);
+      if (
+        msg.includes('invalid authentication credentials') ||
+        msg.includes('401') ||
+        msg.includes('403') ||
+        msg.includes('invalid_grant') ||
+        msg.includes('Expected OAuth 2 access token')
+      ) {
+        setCachedAccessToken(null);
+        showToast('⚠️ Google Sheets session expired. Please reconnect.');
+        handleOpenSettingsModal('sync');
+      } else {
+        showToast(`⚠️ Sheet sync: ${msg}`);
+      }
+    }
+  }, [spreadsheetId, wishlistSheetName, sheetName, sheetHeaders, shows, handleOpenSettingsModal, showToast]);
+
+  // Process offline actions queue when connection is available
+  const handleSyncOfflineQueue = useCallback(async (queue: any[]) => {
+    if (!queue || queue.length === 0) return;
+    const currentSheetId =
+      spreadsheetId ||
+      localStorage.getItem('bingebox_spreadsheet_id') ||
+      localStorage.getItem('showflix_spreadsheet_id');
+    if (!currentSheetId) return;
+
+    let token = await getAccessToken();
+    if (!token && auth.currentUser) {
+      token = await getAccessToken();
+    }
+    if (!token) return;
+
+    for (const action of queue) {
+      try {
+        if (!action.payload) continue;
+        if (action.type === 'DELETE_SHOW') {
+          const { title, rowNumber, sheetTabName } = action.payload;
+          const targetTab = sheetTabName || sheetName || 'MASTER TRACKER';
+          let targetRow = rowNumber;
+          if (!targetRow) {
+            targetRow = (await findRowNumberByTitle(currentSheetId, targetTab, title, token)) ?? undefined;
+          }
+          if (targetRow) {
+            const meta = await fetchSpreadsheetDetails(currentSheetId, token);
+            const tabMeta = meta?.sheets?.find((s: any) => s.title === targetTab);
+            const tabId = tabMeta ? tabMeta.id : 0;
+            await deleteSheetRow(currentSheetId, targetTab, targetRow, tabId, token);
+          }
+        } else if (action.type === 'ADD_SHOW') {
+          const addedShow = action.payload;
+          const targetTab = addedShow.sheetTabName || (addedShow.isWishlist ? wishlistSheetName : sheetName);
+          const liveHeaders = await getSheetTabHeaders(currentSheetId, targetTab, token);
+          await appendSheetRow(currentSheetId, targetTab, addedShow, liveHeaders || sheetHeaders, token);
+        } else if (action.type === 'UPDATE_SHOW') {
+          await syncShowToSheet(action.payload, true);
+        }
+      } catch (e) {
+        console.error('Failed to sync offline action:', action, e);
+      }
+    }
+    clearOfflineQueue();
+    showToast('✨ Offline changes synced with Google Sheet!');
+  }, [spreadsheetId, sheetName, wishlistSheetName, sheetHeaders, syncShowToSheet, showToast]);
+
+  // Fresh, Simple & Reliable Google Sheets Sync: THREE TRIGGERS ONLY
+  const isSyncInProgressRef = useRef(false);
+  const syncGoogleSheet = useCallback(
+    async (trigger: 'first_open' | 'return' | 'force') => {
+      // Prevent overlapping concurrent sync executions
+      if (isSyncInProgressRef.current) return;
+
+      // Offline check: Show honest feedback
+      if (!navigator.onLine || !isOnline) {
+        showToast("🔌 Offline — will sync when you're back online");
+        return;
+      }
+
+      const currentSheetId =
+        spreadsheetId ||
+        localStorage.getItem('bingebox_spreadsheet_id') ||
+        localStorage.getItem('showflix_spreadsheet_id');
+      const currentSheetName =
+        sheetName || localStorage.getItem('bingebox_sheet_name') || 'MASTER TRACKER';
+      const currentWishlistName =
+        wishlistSheetName || localStorage.getItem('bingebox_wishlist_sheet_name') || 'Wishlist';
+      const currentShowcaseName =
+        showcaseSheetName || localStorage.getItem('bingebox_showcase_sheet_name') || 'SHOWCASE';
+
       if (!currentSheetId) return;
 
-      // Rule 1: Toast on start
-      if (isInitial || isManual) {
-        setIsSyncing(true);
+      isSyncInProgressRef.current = true;
+      setIsSyncing(true);
+
+      // Trigger 1 (First Open) & Trigger 3 (Force Re-Sync): "⏱️ Syncing..."
+      // Trigger 2 (Return to Tab): "🔍 Checking for updates..."
+      if (trigger === 'return') {
+        showToast('🔍 Checking for updates...');
+      } else {
         showToast('⏱️ Syncing...');
       }
 
@@ -727,62 +965,62 @@ export default function App() {
         if (!token && auth.currentUser) {
           token = await getAccessToken();
         }
+
         if (!token) {
-          if (isInitial || isManual) {
-            showToast('⚠️ Stale — Refresh page ↻ or tap Reconnect in Settings');
-          }
+          setCachedAccessToken(null);
+          showToast('⚠️ Google Sheets session expired. Please reconnect.');
+          handleOpenSettingsModal('sync');
           return;
+        }
+
+        // Replay any pending offline mutations first so Sheet receives them
+        const pendingQueue = getOfflineQueue();
+        if (pendingQueue.length > 0) {
+          try {
+            await handleSyncOfflineQueue(pendingQueue);
+          } catch (qErr) {
+            console.warn('Syncing offline queue error:', qErr);
+          }
         }
 
         const tabConfigs = [
           { name: currentSheetName, isWishlist: false },
           { name: currentWishlistName, isWishlist: true },
-          { name: currentShowcaseName, isWishlist: false }
+          { name: currentShowcaseName, isWishlist: false },
         ];
 
+        // Fetch fresh LIVE rows directly from Google Sheet — NO cache, check LIVE Sheet directly
         const results = await fetchMultipleSheetRows(currentSheetId, tabConfigs, token);
         const masterParsed = results[currentSheetName] || { shows: [], headers: [], headerRowIndex: 0 };
         const wishlistParsed = results[currentWishlistName] || { shows: [], headers: [], headerRowIndex: 0 };
         const showcaseParsed = results[currentShowcaseName] || { shows: [], headers: [], headerRowIndex: 0 };
-        
-        let combinedShows: ShowItem[] = [
-          ...(masterParsed.shows || []), 
+
+        const combinedShows: ShowItem[] = [
+          ...(masterParsed.shows || []),
           ...(wishlistParsed.shows || []),
-          ...(showcaseParsed.shows || [])
+          ...(showcaseParsed.shows || []),
         ];
 
-        // Deduplicate & preserve sessionAddedAt and createdTimestamp
-        let sessionMap: Record<string, number> = {};
+        // Clear any stale local session caches to keep Preview and iOS 100% in sync
         try {
-          sessionMap = JSON.parse(localStorage.getItem('bingebox_session_added') || '{}');
+          localStorage.removeItem('bingebox_session_added');
         } catch {}
 
-        const existingShowMap = new Map(showsRef.current.map((s) => [s.id, s]));
-        const finalShows = Array.from(new Map(combinedShows.map(s => [s.id, s])).values()).map((newShow) => {
-          const existing = existingShowMap.get(newShow.id);
-          const normTitle = newShow.title ? newShow.title.trim().toLowerCase() : '';
-          const savedSessionTime = sessionMap[newShow.id] || sessionMap[normTitle];
-          const sessionTime = existing?.sessionAddedAt || newShow.sessionAddedAt || savedSessionTime;
-          const createdTs =
-            existing?.createdTimestamp ||
-            newShow.createdTimestamp ||
-            sessionTime ||
-            (newShow.dateAdded ? parseAnyDate(newShow.dateAdded)?.getTime() : undefined);
-          return {
-            ...newShow,
-            sessionAddedAt: sessionTime,
-            createdTimestamp: createdTs,
-          };
-        });
+        // Rebuild addedRank directly from Google Sheet on every load to clear iOS cache
+        const rawShows = Array.from(new Map(combinedShows.map((s) => [s.id, s])).values());
+        const finalShows = rebuildSheetAddedRanks(rawShows);
+
+        // Sort ONLY by addedRank number (highest = newest = first). IGNORE all timestamps/dates.
+        finalShows.sort(compareByAddedRank);
 
         const isChanged = haveShowsChanged(showsRef.current, finalShows);
+        const nowStr = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: true });
 
-        if (finalShows.length > 0 || isChanged) {
+        if (isChanged || showsRef.current.length === 0) {
           setShows(finalShows);
           if (masterParsed.headers && masterParsed.headers.length > 0) {
             setSheetHeaders(masterParsed.headers);
           }
-
           setAppDataCache({
             shows: finalShows,
             headers: masterParsed.headers,
@@ -790,22 +1028,11 @@ export default function App() {
             sheetName: currentSheetName,
             wishlistSheetName: currentWishlistName,
             showcaseSheetName: currentShowcaseName,
-            customViewers: finalShows.length > 0 ? customViewers : undefined
-          });
-        } else if (finalShows.length === 0 && showsRef.current.length > 0) {
-          setShows([]);
-          setAppDataCache({
-            shows: [],
-            headers: masterParsed.headers || [],
-            spreadsheetId: currentSheetId,
-            sheetName: currentSheetName,
-            wishlistSheetName: currentWishlistName,
-            showcaseSheetName: currentShowcaseName,
-            customViewers: undefined
+            customViewers: finalShows.length > 0 ? customViewers : undefined,
           });
         }
-        
-        // Sync custom viewers list if lists tab exists
+
+        // Sync custom viewers if lists tab exists
         try {
           const storedTabs = localStorage.getItem('bingebox_available_sheet_tabs');
           const tabs: string[] = storedTabs ? JSON.parse(storedTabs) : availableTabs;
@@ -821,42 +1048,72 @@ export default function App() {
               localStorage.setItem('showflix_viewer_colors', JSON.stringify(viewerRes.colors));
             }
           }
-        } catch (listsErr) {
-          // Silent catch
-        }
+        } catch {}
 
-        const nowStr = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: true });
         setLastSyncedAt(nowStr);
 
-        // Feedback Toasts
-        if (isInitial || isManual) {
+        // Feedback messaging according to the THREE TRIGGERS:
+        if (trigger === 'first_open') {
+          // 1. PAGE FIRST OPENS:
+          // - New data found → "✅ Synced — Last updated: {time}"
+          // - No changes → "✅ Up to date"
           if (isChanged || showsRef.current.length === 0) {
             showToast(`✅ Synced — Last updated: ${nowStr}`);
           } else {
             showToast('✅ Up to date');
           }
-        } else if (isReturn) {
+        } else if (trigger === 'return') {
+          // 2. YOU RETURN TO TAB / FOCUS PAGE:
+          // - Changed → refresh + "🔄 Updated"
+          // - Same → quiet, no extra message
+          if (isChanged) {
+            showToast('🔄 Updated');
+          }
+        } else if (trigger === 'force') {
+          // 3. FORCE RE-SYNC BUTTON:
+          // - Changed → "✅ Synced — Last updated: {time}"
+          // - Same → "✅ Up to date"
           if (isChanged) {
             showToast(`✅ Synced — Last updated: ${nowStr}`);
-          }
-        } else if (isBackground) {
-          if (isChanged) {
-            showToast('🔄 Updates found — refreshed');
+          } else {
+            showToast('✅ Up to date');
           }
         }
-      } catch (e: any) {
-        console.warn('Sync notice:', e);
-        if (isInitial || isManual) {
-          showToast('⚠️ Stale — Refresh page ↻ or tap Reconnect in Settings');
+      } catch (err: any) {
+        console.error('Google Sheets sync error:', err);
+        const msg = err?.message || String(err);
+        if (
+          msg.includes('invalid authentication credentials') ||
+          msg.includes('401') ||
+          msg.includes('403') ||
+          msg.includes('invalid_grant') ||
+          msg.includes('Expected OAuth 2 access token')
+        ) {
+          setCachedAccessToken(null);
+          showToast('⚠️ Google Sheets session expired. Please reconnect.');
+          handleOpenSettingsModal('sync');
+        } else {
+          showToast(`⚠️ Sync notice: ${msg}`);
         }
       } finally {
-        if (isInitial || isManual) {
-          setIsSyncing(false);
-        }
+        setIsSyncing(false);
+        isSyncInProgressRef.current = false;
       }
     },
-    [spreadsheetId, sheetName, wishlistSheetName, showcaseSheetName, availableTabs, isOnline, syncOnlyOnWifi]
+    [
+      spreadsheetId,
+      sheetName,
+      wishlistSheetName,
+      showcaseSheetName,
+      availableTabs,
+      isOnline,
+      customViewers,
+      handleOpenSettingsModal,
+      showToast,
+      handleSyncOfflineQueue,
+    ]
   );
+  syncGoogleSheetRef.current = syncGoogleSheet;
 
   // Handle Firebase sign-in redirect results on load
   useEffect(() => {
@@ -956,78 +1213,78 @@ export default function App() {
             console.warn('[Pre-flight Check] Notice while checking cloud sheet configuration:', e);
           }
         }
-
-        // Automatically fetch latest shows from the saved Google Sheet on load
-        if (activeSheetId && token) {
-          console.log('[Background Refresh] Auth ready, syncing sheet data...');
-          fetchLatestFromSheet('initial');
-        }
       },
       () => {
         setUser(DEFAULT_PROFILE_USER);
       }
     );
     return () => unsubscribe();
-  }, [fetchLatestFromSheet]);
+  }, []);
 
-  // Rule 1: Immediate Auto-Sync on Page Load / App Refresh (Runs ONCE clearly)
-  const pageLoadSyncRef = useRef(false);
+  // TRIGGER 1: PAGE FIRST OPENS (Runs once on mount)
+  const pageFirstOpenRef = useRef(false);
   useEffect(() => {
-    const activeSheetId = spreadsheetId || localStorage.getItem('bingebox_spreadsheet_id');
-    if (activeSheetId && !pageLoadSyncRef.current) {
-      pageLoadSyncRef.current = true;
-      if (!navigator.onLine) {
-        showToast('🔌 Offline');
-      } else {
-        fetchLatestFromSheet('initial');
-      }
+    if (pageFirstOpenRef.current) return;
+    pageFirstOpenRef.current = true;
+
+    if (!navigator.onLine) {
+      showToast("🔌 Offline — will sync when you're back online");
+      return;
     }
-  }, [spreadsheetId, fetchLatestFromSheet]);
 
-  // Rule 5: Background Auto-Sync only if page stays active (not idle)
-  useEffect(() => {
-    if (!autoSyncEnabled || !spreadsheetId || !isOnline) return;
+    const activeSheetId =
+      spreadsheetId ||
+      localStorage.getItem('bingebox_spreadsheet_id') ||
+      localStorage.getItem('showflix_spreadsheet_id');
 
-    const intervalMs = (syncFrequency || 900) * 1000;
-    const intervalId = setInterval(() => {
-      if (document.visibilityState === 'visible' && navigator.onLine) {
-        fetchLatestFromSheet('background');
-      }
-    }, intervalMs);
+    if (activeSheetId) {
+      syncGoogleSheet('first_open');
+    }
+  }, [spreadsheetId, syncGoogleSheet, showToast]);
 
-    return () => clearInterval(intervalId);
-  }, [autoSyncEnabled, spreadsheetId, syncFrequency, isOnline, fetchLatestFromSheet]);
-
-  // Listen for Google Sheets 403 API permission notices (No auto-popup ever)
+  // Listen for Google Sheets 403 API permission notices (Auto-opens Settings on Sheets section)
   useEffect(() => {
     const handleGoogleSheets403 = () => {
-      showToast('⚠️ Stale — Refresh page ↻ or tap Reconnect in Settings');
+      showToast('⚠️ Google Sheets session expired. Please reconnect.');
+      handleOpenSettingsModal('sync');
     };
 
     window.addEventListener('google-sheets-403', handleGoogleSheets403);
     return () => {
       window.removeEventListener('google-sheets-403', handleGoogleSheets403);
     };
-  }, []);
+  }, [handleOpenSettingsModal, showToast]);
 
-  // Rule 4: Every time user returns to tab / page becomes visible -> run fresh sync check
+  // TRIGGER 2: YOU RETURN TO TAB / FOCUS PAGE (Clean fresh sync, direct live check)
+  const lastTabFocusTimeRef = useRef(0);
   useEffect(() => {
-    if (!autoSyncEnabled || !spreadsheetId) return;
+    const handleReturnToTab = () => {
+      if (document.visibilityState === 'hidden') return;
+      const now = Date.now();
+      // Debounce duplicate events within 500ms
+      if (now - lastTabFocusTimeRef.current < 500) return;
+      lastTabFocusTimeRef.current = now;
 
-    const handleVisibilityOrFocus = () => {
-      if (document.visibilityState === 'visible' && navigator.onLine) {
-        fetchLatestFromSheet('return');
+      const activeSheetId =
+        spreadsheetId ||
+        localStorage.getItem('bingebox_spreadsheet_id') ||
+        localStorage.getItem('showflix_spreadsheet_id');
+
+      if (activeSheetId) {
+        syncGoogleSheet('return');
       }
     };
 
-    window.addEventListener('focus', handleVisibilityOrFocus);
-    document.addEventListener('visibilitychange', handleVisibilityOrFocus);
+    window.addEventListener('focus', handleReturnToTab);
+    document.addEventListener('visibilitychange', handleReturnToTab);
+    window.addEventListener('pageshow', handleReturnToTab);
 
     return () => {
-      window.removeEventListener('focus', handleVisibilityOrFocus);
-      document.removeEventListener('visibilitychange', handleVisibilityOrFocus);
+      window.removeEventListener('focus', handleReturnToTab);
+      document.removeEventListener('visibilitychange', handleReturnToTab);
+      window.removeEventListener('pageshow', handleReturnToTab);
     };
-  }, [autoSyncEnabled, spreadsheetId, fetchLatestFromSheet]);
+  }, [spreadsheetId, syncGoogleSheet]);
 
 
 
@@ -1246,7 +1503,8 @@ export default function App() {
       const msg = err?.message || String(err);
       if (msg.includes('invalid authentication credentials') || msg.includes('401') || msg.includes('invalid_grant') || msg.includes('Expected OAuth 2 access token')) {
         setCachedAccessToken(null);
-        showToast('⚠️ Google Sheets session expired. Please sign in again with Google.');
+        showToast('⚠️ Google Sheets session expired. Opening Sheets Settings...');
+        handleOpenSettingsModal('sync');
       }
       throw err;
     } finally {
@@ -1284,213 +1542,6 @@ export default function App() {
       setAppDataCache({ shows: [], spreadsheetId: '' });
     } catch {}
     showToast('Disconnected Google Sheets');
-  };
-
-  // Helper: auto-sync updated show to Google Sheet (reliable non-blocking live update)
-  const syncShowToSheet = async (updatedShow: ShowItem, isExplicitSave = false) => {
-    if (!navigator.onLine) {
-      queueOfflineAction('UPDATE_SHOW', updatedShow);
-      showToast('📴 Offline: Change queued locally and will sync when online');
-      return;
-    }
-
-    if (!spreadsheetId) {
-      setShowSyncModal(true);
-      showToast('⚠️ Connect your Google Sheet to enable live sync');
-      return;
-    }
-
-    const targetTab = updatedShow.sheetTabName || (updatedShow.isWishlist ? wishlistSheetName : sheetName);
-    console.log(`[Google Sheets Sync] Syncing show "${updatedShow.title}" to tab "${targetTab}" with posterUrl: "${updatedShow.posterUrl || 'none'}"`);
-
-    let rowNum = updatedShow.rowNumber;
-    let currentHeaders = updatedShow.isWishlist ? DEFAULT_WISHLIST_HEADERS : sheetHeaders;
-
-    try {
-      let token = await getAccessToken();
-      if (!token) {
-        showToast('🔑 Authenticating Google session...');
-        const authRes = await handleSignIn();
-        token = authRes?.accessToken || null;
-      }
-
-      if (!token) {
-        setShowSyncModal(true);
-        showToast('⚠️ Google sign-in required. Please click Connect to sign in.');
-        return;
-      }
-
-      // If show has a poster image and sheet lacks a poster column, ensure it exists
-      const liveHeaders = await getSheetTabHeaders(spreadsheetId, targetTab, token);
-      if (liveHeaders && liveHeaders.length > 0) {
-        currentHeaders = liveHeaders;
-      }
-
-      if (!updatedShow.isWishlist && updatedShow.posterUrl && !currentHeaders.some((h, i) => h.toLowerCase().includes('poster') || h.toLowerCase().includes('image') || i === 15)) {
-        try {
-          const colRes = await ensurePosterColumnInSheet(spreadsheetId, targetTab, currentHeaders, token);
-          if (colRes.wasAdded) {
-            currentHeaders = colRes.headers;
-            setSheetHeaders(currentHeaders);
-            try {
-              localStorage.setItem('bingebox_sheet_headers', JSON.stringify(currentHeaders));
-            } catch {}
-          }
-        } catch (e) {
-          console.warn('Could not auto-add poster column:', e);
-        }
-      }
-
-      // If target tab is Wishlist, ensure tab exists
-      if (updatedShow.isWishlist) {
-        try {
-          const tabRes = await ensureSheetTabExists(spreadsheetId, targetTab, DEFAULT_WISHLIST_HEADERS, token);
-          if (tabRes.actualTitle && tabRes.actualTitle !== targetTab) {
-            updatedShow.sheetTabName = tabRes.actualTitle;
-          }
-        } catch (tabErr) {
-          console.warn('Ensure wishlist tab in syncShowToSheet:', tabErr);
-        }
-      }
-
-      // 1. Resolve row number in the sheet
-      if (!rowNum) {
-        rowNum = (await findRowNumberByTitle(spreadsheetId, targetTab, updatedShow.title, token)) ?? undefined;
-      }
-
-      // --- DEEP VERIFICATION STEP ---
-      // For quick actions (increment episode, toggle status), ensure releaseDate and releaseNote are not lost
-      if (!isExplicitSave) {
-        const existingShow = shows.find(
-          (s) =>
-            s.id === updatedShow.id ||
-            (s.title && updatedShow.title && s.title.toLowerCase().trim() === updatedShow.title.toLowerCase().trim())
-        );
-
-        let verifiedReleaseDate = updatedShow.releaseDate?.trim();
-        let verifiedReleaseNote = updatedShow.releaseNote?.trim();
-
-        // Check state fallback: if incoming show has empty/undefined, but existing state has valid values, preserve them!
-        if (!verifiedReleaseDate && existingShow?.releaseDate?.trim()) {
-          verifiedReleaseDate = existingShow.releaseDate.trim();
-          console.log(`[Google Sheets Deep Verification] Preserved releaseDate from local state for "${updatedShow.title}": "${verifiedReleaseDate}"`);
-        }
-        if (!verifiedReleaseNote && existingShow?.releaseNote?.trim()) {
-          verifiedReleaseNote = existingShow.releaseNote.trim();
-          console.log(`[Google Sheets Deep Verification] Preserved releaseNote from local state for "${updatedShow.title}": "${verifiedReleaseNote}"`);
-        }
-
-        // Live Sheet fallback: if still missing and row exists in Google Sheets, query the live sheet row
-        if ((!verifiedReleaseDate || !verifiedReleaseNote) && rowNum && spreadsheetId) {
-          try {
-            const checkRange = formatA1Range(targetTab, `Q${rowNum}:R${rowNum}`);
-            const checkRes = await fetch(
-              `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/${encodeURIComponent(checkRange)}`,
-              { headers: { Authorization: `Bearer ${token}` } }
-            );
-            if (checkRes.ok) {
-              const checkData = await checkRes.json();
-              const rowCells = checkData.values?.[0];
-              if (rowCells) {
-                const liveDate = rowCells[0]?.trim();
-                const liveNote = rowCells[1]?.trim();
-                if (!verifiedReleaseDate && liveDate) {
-                  verifiedReleaseDate = liveDate;
-                  console.log(`[Google Sheets Deep Verification] Preserved live sheet releaseDate for "${updatedShow.title}": "${liveDate}"`);
-                }
-                if (!verifiedReleaseNote && liveNote) {
-                  verifiedReleaseNote = liveNote;
-                  console.log(`[Google Sheets Deep Verification] Preserved live sheet releaseNote for "${updatedShow.title}": "${liveNote}"`);
-                }
-              }
-            }
-          } catch (checkErr) {
-            console.warn('[Google Sheets Deep Verification] Querying live sheet release fields error:', checkErr);
-          }
-        }
-
-        // Apply verified values to updatedShow
-        updatedShow.releaseDate = verifiedReleaseDate || undefined;
-        updatedShow.releaseNote = verifiedReleaseNote || undefined;
-      }
-
-      // 2. If row not found in sheet, automatically append it so the Google Sheet is updated!
-      if (!rowNum) {
-        showToast(`Adding "${updatedShow.title}" to ${targetTab}...`);
-        const appendRes = await appendSheetRow(spreadsheetId, targetTab, updatedShow, currentHeaders, token);
-        rowNum = appendRes.rowNumber;
-        if (rowNum) {
-          updatedShow.rowNumber = rowNum;
-          setShows((prev) =>
-            prev.map((s) =>
-              s.id === updatedShow.id
-                ? { ...s, rowNumber: rowNum, sheetTabName: targetTab, releaseDate: updatedShow.releaseDate, releaseNote: updatedShow.releaseNote }
-                : s
-            )
-          );
-        }
-        showToast(`✅ Synced "${updatedShow.title}" to "${targetTab}"!`);
-        return;
-      }
-
-      console.log(`[Google Sheets Sync] Updating existing row ${rowNum} for "${updatedShow.title}" in tab "${targetTab}"`);
-
-      // 3. Row exists: sync entire row values in a single API call to minimize Google Sheets write quota consumption
-      await updateSheetRow(
-        spreadsheetId,
-        targetTab,
-        rowNum,
-        updatedShow,
-        currentHeaders,
-        token
-      );
-
-      // Keep rowNumber and release info updated in state
-      setShows((prev) =>
-        prev.map((s) =>
-          s.id === updatedShow.id
-            ? { ...s, rowNumber: rowNum, sheetTabName: targetTab, releaseDate: updatedShow.releaseDate, releaseNote: updatedShow.releaseNote }
-            : s
-        )
-      );
-
-      showToast(`✅ Google Sheet Updated: "${updatedShow.title}" (${targetTab})`);
-    } catch (err: any) {
-      console.error('Failed to sync show to Google Sheets:', err);
-      const msg = err?.message || String(err);
-      if (
-        msg.includes('invalid authentication credentials') ||
-        msg.includes('401') ||
-        msg.includes('403') ||
-        msg.includes('invalid_grant') ||
-        msg.includes('Expected OAuth 2 access token')
-      ) {
-        setCachedAccessToken(null);
-        try {
-          showToast('🔑 Session expired, re-authenticating Google...');
-          const authRes = await handleSignIn();
-          const newToken = authRes?.accessToken;
-          if (newToken && rowNum) {
-            await updateSheetRow(
-              spreadsheetId,
-              targetTab,
-              rowNum,
-              updatedShow,
-              currentHeaders,
-              newToken
-            );
-            showToast(`✅ Google Sheet Updated: "${updatedShow.title}" (${targetTab})`);
-            return;
-          }
-        } catch (retryErr) {
-          console.warn('Auto re-auth retry failed:', retryErr);
-        }
-        setShowSyncModal(true);
-        showToast('⚠️ Google Sheets session expired. Please click Connect to re-authenticate.');
-      } else {
-        showToast(`⚠️ Sheet sync: ${msg}`);
-      }
-    }
   };
 
   // Release date check - preserve all user premiere dates and notes permanently
@@ -1665,6 +1716,23 @@ export default function App() {
         onConfirm: async () => {
           setConfirmState((prev) => ({ ...prev, isOpen: false }));
           let targetRow = showToDelete.rowNumber;
+
+          // Full Offline support: remove locally now, queue deletion to Google Sheet later
+          if (!navigator.onLine) {
+            queueOfflineAction('DELETE_SHOW', {
+              id: showToDelete.id,
+              title: showToDelete.title,
+              rowNumber: showToDelete.rowNumber,
+              sheetTabName: targetTab,
+            });
+            setShows((prev) => prev.filter((s) => s.id !== showToDelete.id));
+            if (selectedShow?.id === showToDelete.id) {
+              setSelectedShow(null);
+            }
+            showToast(`📴 Offline: Removed "${showToDelete.title}" locally — will delete from Sheet when online`);
+            return;
+          }
+
           try {
             let token = await getAccessToken();
             if (!token) {
@@ -1691,6 +1759,9 @@ export default function App() {
                   targetTab === sheetName ? sheetTabId : undefined,
                   token
                 );
+                setAppDataCache({ shows: [] });
+                updateRemoteSync(); // Trigger remote sync
+                syncGoogleSheet('force'); // Trigger automatic reload
                 showToast(`Deleted "${showToDelete.title}" from "${targetTab}"`);
               } else {
                 showToast(`Removed "${showToDelete.title}" from Tracker`);
@@ -1701,7 +1772,8 @@ export default function App() {
             const msg = err?.message || String(err);
             if (msg.includes('invalid authentication credentials') || msg.includes('401') || msg.includes('invalid_grant') || msg.includes('Expected OAuth 2 access token')) {
               setCachedAccessToken(null);
-              showToast('⚠️ Google Sheets session expired. Please open Google Sheets Settings and reconnect.');
+              showToast('⚠️ Google Sheets session expired. Opening Sheets Settings...');
+              handleOpenSettingsModal('sync');
             } else {
               showToast(`Removed locally. Sheet error: ${msg}`);
             }
@@ -1771,12 +1843,21 @@ export default function App() {
     const isMovie = newShow.type === 'Movie';
     const targetTab = newShow.sheetTabName || (isWishlist ? wishlistSheetName : sheetName);
     const now = Date.now();
+    // Pure numeric sort order: guaranteed highest number so new show jumps straight to front on all devices
+    const currentMaxSortOrder = shows.reduce((max, s) => {
+      const n = typeof s.sortOrderNum === 'number' && !isNaN(s.sortOrderNum) ? s.sortOrderNum : 0;
+      return n > max ? n : max;
+    }, 0);
+    const newSortOrderNum = Math.max(currentMaxSortOrder + 1000, now);
+
     const sanitizedShow: ShowItem = {
       ...newShow,
       isWishlist,
       sheetTabName: targetTab,
+      addedTime: Date.now(),
       sessionAddedAt: now,
-      createdTimestamp: newShow.createdTimestamp || now,
+      createdTimestamp: now,
+      sortOrderNum: newSortOrderNum,
       dateAdded: newShow.dateAdded || getTodayDDMMYYYY(),
       seasons: isMovie || isWishlist ? '' : normalizeSeasonStr(newShow.seasons),
       episodes: isMovie || isWishlist ? '' : normalizeEpisodeStr(newShow.episodes),
@@ -1801,10 +1882,19 @@ export default function App() {
       enableShowNotificationSilent(sanitizedShow.id);
     }
     setShows((prev) => [sanitizedShow, ...prev]);
+    setAppDataCache({ shows: [] }); // Clear cache
+    syncGoogleSheet('force'); // Trigger automatic reload
     showToast(`✨ Added "${sanitizedShow.title}" to ${isWishlist ? 'Wishlist' : 'Master Tracker'}`);
 
-    // 2. Asynchronous background sync to Google Sheets
+    // 2. Asynchronous background sync to Google Sheets (or queue if offline)
+    if (!navigator.onLine) {
+      queueOfflineAction('ADD_SHOW', sanitizedShow);
+      showToast(`📴 Offline: Saved "${sanitizedShow.title}" locally — will sync to Sheet when online`);
+      return;
+    }
+
     if (spreadsheetId) {
+      updateRemoteSync(); // Trigger remote sync
       (async () => {
         let addedShow = { ...sanitizedShow };
         try {
@@ -1873,7 +1963,8 @@ export default function App() {
           const msg = err?.message || String(err);
           if (msg.includes('invalid authentication credentials') || msg.includes('401') || msg.includes('invalid_grant') || msg.includes('Expected OAuth 2 access token')) {
             setCachedAccessToken(null);
-            showToast('⚠️ Google Sheets session expired. Please open Google Sheets Settings to reconnect.');
+            showToast('⚠️ Google Sheets session expired. Opening Sheets Settings...');
+            handleOpenSettingsModal('sync');
           }
         }
       })();
@@ -1972,8 +2063,8 @@ export default function App() {
         msg.includes('Expected OAuth 2 access token')
       ) {
         setCachedAccessToken(null);
-        setShowSyncModal(true);
-        showToast('⚠️ Google Sheets session expired. Please click Connect to re-authenticate.');
+        showToast('⚠️ Google Sheets session expired. Opening Sheets Settings...');
+        handleOpenSettingsModal('sync');
       } else {
         showToast(`⚠️ Could not move to wishlist: ${msg}`);
       }
@@ -2090,8 +2181,8 @@ export default function App() {
         msg.includes('Expected OAuth 2 access token')
       ) {
         setCachedAccessToken(null);
-        setShowSyncModal(true);
-        showToast('⚠️ Google Sheets session expired. Please click Connect to re-authenticate.');
+        showToast('⚠️ Google Sheets session expired. Opening Sheets Settings...');
+        handleOpenSettingsModal('sync');
       } else {
         showToast(`⚠️ Could not move to master tracker: ${msg}`);
       }
@@ -2204,8 +2295,11 @@ export default function App() {
       });
     }
 
-    // 5. Sorting
+    // 5. Sorting: Pure numeric sortOrder number DESCENDING for recently-added (highest = newest = top)
     return [...list].sort((a, b) => {
+      if (sortOrder === 'recently-added') {
+        return compareRecentlyAdded(a, b);
+      }
       if (sortOrder === 'title-asc') {
         return a.title.localeCompare(b.title);
       }
@@ -2227,7 +2321,7 @@ export default function App() {
       if (sortOrder === 'progress-asc') {
         return calculateShowProgress(a) - calculateShowProgress(b);
       }
-      return 0;
+      return compareRecentlyAdded(a, b);
     });
   }, [baseFilteredList, selectedPlatform, sortOrder]);
 
@@ -2357,45 +2451,9 @@ export default function App() {
   // Show category collections
   const recentlyAddedShows = useMemo(() => {
     if (!profileFilteredShows || profileFilteredShows.length === 0) return [];
-
-    let sessionMap: Record<string, number> = {};
-    try {
-      sessionMap = JSON.parse(localStorage.getItem('bingebox_session_added') || '{}');
-    } catch {}
-
     const copy = [...profileFilteredShows];
-
-    copy.sort((a, b) => {
-      // 1. Newly added titles in this session ALWAYS take absolute priority and show at the front!
-      const sessA = a.sessionAddedAt || sessionMap[a.id] || (a.title ? sessionMap[a.title.trim().toLowerCase()] : 0) || 0;
-      const sessB = b.sessionAddedAt || sessionMap[b.id] || (b.title ? sessionMap[b.title.trim().toLowerCase()] : 0) || 0;
-
-      if (sessA > 0 || sessB > 0) {
-        if (sessA !== sessB) return sessB - sessA;
-      }
-
-      // 2. Check exact creation timestamp (higher = added more recently)
-      const tsA = a.createdTimestamp || (a.dateAdded ? parseAnyDate(a.dateAdded)?.getTime() : null);
-      const tsB = b.createdTimestamp || (b.dateAdded ? parseAnyDate(b.dateAdded)?.getTime() : null);
-
-      if (tsA && tsB && tsA !== tsB) {
-        return tsB - tsA;
-      }
-      if (tsA && !tsB) return -1;
-      if (!tsA && tsB) return 1;
-
-      // 3. Pending items without rowNumber (newly added, syncing in background) come first
-      if (!a.rowNumber && b.rowNumber) return -1;
-      if (a.rowNumber && !b.rowNumber) return 1;
-
-      // 4. Higher rowNumber in Google Sheet = appended later = more recent
-      if (a.rowNumber && b.rowNumber && a.rowNumber !== b.rowNumber) {
-        return b.rowNumber - a.rowNumber;
-      }
-
-      return 0;
-    });
-
+    // Pure numeric sortOrder number DESCENDING (highest = newest = top)
+    copy.sort(compareRecentlyAdded);
     return copy.slice(0, 20);
   }, [profileFilteredShows]);
 
@@ -3182,6 +3240,7 @@ export default function App() {
                         onChange={(e) => setSortOrder(e.target.value)}
                         className="bg-zinc-800/90 border border-zinc-700 text-zinc-300 text-[11px] font-bold rounded-full pl-7 pr-7 py-1 appearance-none focus:outline-none focus:border-red-500 focus:ring-1 focus:ring-red-500/50 transition-all cursor-pointer hover:bg-zinc-700 hover:text-white shadow-sm"
                       >
+                        <option value="recently-added">Recently Added (Newest to Top)</option>
                         <option value="title-asc">Title (A-Z)</option>
                         <option value="title-desc">Title (Z-A)</option>
                         <option value="year-newest">Year (Newest)</option>
@@ -3864,7 +3923,7 @@ export default function App() {
         isSyncing={isSyncing}
         lastSyncedAt={lastSyncedAt}
         autoSyncEnabled={autoSyncEnabled}
-        onTriggerSync={() => fetchLatestFromSheet('manual')}
+        onTriggerSync={() => syncGoogleSheet('force')}
         accessibilitySettings={accessibilitySettings}
         setAccessibilitySettings={setAccessibilitySettings}
         onOpenDashboard={() => setShowStatsModal(true)}
@@ -4078,7 +4137,7 @@ export default function App() {
           onUpdateSyncFrequency={handleUpdateSyncFrequency}
           syncOnlyOnWifi={syncOnlyOnWifi}
           onToggleSyncOnlyOnWifi={handleToggleSyncOnlyOnWifi}
-          onTriggerSync={() => fetchLatestFromSheet('manual')}
+          onTriggerSync={() => syncGoogleSheet('force')}
           isOnline={isOnline}
           customViewers={customViewers}
           onUpdateCustomViewers={handleUpdateCustomViewers}

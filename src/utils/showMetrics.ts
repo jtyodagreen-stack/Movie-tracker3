@@ -1,4 +1,5 @@
 import { ShowItem } from '../types';
+import { parseAnyDate } from './dateUtils';
 
 /**
  * Normalizes and extracts numeric rating (1-5) from ratingNum or rating string.
@@ -128,3 +129,55 @@ export function calculateStandardStats(shows: ShowItem[]) {
     totalCompletionRate,
   };
 }
+
+/**
+ * Rebuilds pure numeric `addedRank` directly from Sheet data on every load.
+ * Clears any stale iOS or browser cache.
+ * Higher rowNumber = appended later = higher addedRank = newest = first.
+ * Completely ignores all timestamps/dates for 100% cross-platform parity.
+ */
+export function rebuildSheetAddedRanks(showList: ShowItem[]): ShowItem[] {
+  if (!showList || showList.length === 0) return [];
+  return showList.map((show, idx) => {
+    const rowNum = typeof show.rowNumber === 'number' && !isNaN(show.rowNumber) && show.rowNumber > 0
+      ? show.rowNumber
+      : idx + 1;
+    // Master tab gets bonus 2, Wishlist gets bonus 1 for deterministic tie-break across tabs
+    const tabBonus = show.isWishlist ? 1 : 2;
+    const rank = rowNum * 10 + tabBonus;
+
+    return {
+      ...show,
+      addedTime: show.addedTime || Date.now(),
+      addedRank: rank,
+      sortOrderNum: rank,
+    };
+  });
+}
+
+export const ensureSortOrderNumbers = rebuildSheetAddedRanks;
+
+/**
+ * Sort ONLY by addedRank number (highest = newest = first).
+ * IGNORE all timestamps/dates — pure numbers = same on ALL browsers (iOS, Preview, Android).
+ */
+export function compareByAddedRank(a: ShowItem, b: ShowItem): number {
+  if (a.id === b.id) return 0;
+  const rankA = typeof a.addedRank === 'number' && !isNaN(a.addedRank)
+    ? a.addedRank
+    : (typeof a.sortOrderNum === 'number' && !isNaN(a.sortOrderNum) ? a.sortOrderNum : 0);
+  const rankB = typeof b.addedRank === 'number' && !isNaN(b.addedRank)
+    ? b.addedRank
+    : (typeof b.sortOrderNum === 'number' && !isNaN(b.sortOrderNum) ? b.sortOrderNum : 0);
+  if (rankA !== rankB) {
+    return rankB - rankA; // HIGHEST = NEWEST = FIRST
+  }
+  const rowA = typeof a.rowNumber === 'number' && !isNaN(a.rowNumber) ? a.rowNumber : 0;
+  const rowB = typeof b.rowNumber === 'number' && !isNaN(b.rowNumber) ? b.rowNumber : 0;
+  if (rowA !== rowB) {
+    return rowB - rowA;
+  }
+  return 0;
+}
+
+export const compareRecentlyAdded = compareByAddedRank;

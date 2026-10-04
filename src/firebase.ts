@@ -19,6 +19,9 @@ import {
   getDoc,
   setDoc,
   getDocFromServer,
+  onSnapshot,
+  serverTimestamp,
+  collection,
 } from 'firebase/firestore';
 import { getStorage } from 'firebase/storage';
 import firebaseConfig from '../firebase-applet-config.json';
@@ -28,6 +31,7 @@ const app = getApps().length === 0 ? initializeApp(firebaseConfig) : getApp();
 export const auth = getAuth(app);
 export const db = getFirestore(app, firebaseConfig.firestoreDatabaseId);
 export const storage = getStorage(app);
+export { doc, setDoc, onSnapshot, serverTimestamp, collection };
 
 export const SCOPES = ['https://www.googleapis.com/auth/spreadsheets'];
 
@@ -333,9 +337,7 @@ export const googleSignIn = async (): Promise<{ user: User; accessToken: string 
       }
 
       cachedAccessToken = credential.accessToken;
-      if (typeof window !== 'undefined') {
-        sessionStorage.setItem('bingebox_google_access_token', credential.accessToken);
-      }
+      setCachedAccessToken(credential.accessToken);
 
       // Extract and persist Google account profile details
       const addInfo = getAdditionalUserInfo(result);
@@ -407,9 +409,7 @@ export const handleRedirectResultOnLoad = async (): Promise<{ user: User; access
       const credential = GoogleAuthProvider.credentialFromResult(result);
       if (credential?.accessToken) {
         cachedAccessToken = credential.accessToken;
-        if (typeof window !== 'undefined') {
-          sessionStorage.setItem('bingebox_google_access_token', credential.accessToken);
-        }
+        setCachedAccessToken(credential.accessToken);
         return { user: result.user, accessToken: credential.accessToken };
       }
     }
@@ -425,41 +425,30 @@ export const getAccessToken = async (forceRefresh = false): Promise<string | nul
     cachedAccessToken = null; // Clear the cached invalid token
     if (typeof window !== 'undefined') {
       sessionStorage.removeItem('bingebox_google_access_token');
+      localStorage.removeItem('showflix_google_access_token');
     }
     if (auth.currentUser) {
       if (typeof navigator !== 'undefined' && !navigator.onLine) {
         console.warn('[Auth] Network is offline, skipping force token refresh.');
         return cachedAccessToken;
       }
-      // Retry mechanism for network failures with exponential backoff
-      let retries = 3;
-      let delay = 1500;
-      while (retries > 0) {
-        try {
-          await auth.currentUser.getIdToken(true);
-          console.log('[Auth] Refreshed Firebase session successfully');
-          break;
-        } catch (err: any) {
-          retries--;
-          const errCode = err?.code || String(err);
-          if (errCode.includes('network-request-failed') || (typeof navigator !== 'undefined' && !navigator.onLine)) {
-            console.warn(`[Auth] Network unavailable or request failed during token refresh (${retries} retries left).`);
-          } else {
-            console.warn(`[Auth] Token refresh notice (${retries} retries left):`, errCode);
-          }
-          if (retries > 0) {
-            await new Promise(resolve => setTimeout(resolve, delay));
-            delay *= 2;
-          }
-        }
+      try {
+        await auth.currentUser.getIdToken(true);
+      } catch (err: any) {
+        console.warn('[Auth] Token refresh notice:', err);
       }
     }
   }
 
   if (!cachedAccessToken && typeof window !== 'undefined') {
-    const stored = sessionStorage.getItem('bingebox_google_access_token');
-    if (stored) {
-      cachedAccessToken = stored;
+    const storedSession = sessionStorage.getItem('bingebox_google_access_token');
+    const storedLocal = localStorage.getItem('showflix_google_access_token') || localStorage.getItem('bingebox_google_access_token');
+    const token = storedSession || storedLocal;
+    if (token) {
+      cachedAccessToken = token;
+      if (!storedSession) {
+        sessionStorage.setItem('bingebox_google_access_token', token);
+      }
     }
   }
 
@@ -491,8 +480,12 @@ export const setCachedAccessToken = (token: string | null) => {
   if (typeof window !== 'undefined') {
     if (token) {
       sessionStorage.setItem('bingebox_google_access_token', token);
+      localStorage.setItem('showflix_google_access_token', token);
+      localStorage.setItem('showflix_google_token_time', String(Date.now()));
     } else {
       sessionStorage.removeItem('bingebox_google_access_token');
+      localStorage.removeItem('showflix_google_access_token');
+      localStorage.removeItem('showflix_google_token_time');
     }
   }
 };
@@ -502,5 +495,7 @@ export const logout = async () => {
   cachedAccessToken = null;
   if (typeof window !== 'undefined') {
     sessionStorage.removeItem('bingebox_google_access_token');
+    localStorage.removeItem('showflix_google_access_token');
+    localStorage.removeItem('showflix_google_token_time');
   }
 };

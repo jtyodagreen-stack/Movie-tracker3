@@ -575,6 +575,8 @@ export default function AddShowModal({
       imdbId: imdbId || posterResult?.imdbId || undefined,
       releaseDate: releaseDate ? parseGoogleSheetsDate(releaseDate) : undefined,
       releaseNote: releaseNote.trim() || undefined,
+      createdTimestamp: Date.now(),
+      addedTime: Date.now(),
     };
 
     // Auto-enable release notification bell by default for newly added titles

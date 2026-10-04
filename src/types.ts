@@ -39,8 +39,11 @@ export interface ShowItem {
   sheetTabName?: string; // The specific sheet tab this show belongs to (e.g. MASTER TRACKER, Wishlist)
   priority?: string; // e.g. "High", "Medium", "Low"
   dateAdded?: string; // e.g. "2026-09-21"
+  addedTime?: number; // Epoch ms when added
   createdTimestamp?: number; // Exact Epoch ms when show was added to tracker
   sessionAddedAt?: number; // Priority timestamp for newly added titles
+  sortOrderNum?: number; // Pure numeric order index: highest = newest = top (identical on iOS, mobile, desktop)
+  addedRank?: number; // Pure numeric addedRank: highest = newest = first (rebuilt from Sheet on every load)
   imdbId?: string; // Official IMDb ID (e.g. tt1234567)
   // Live Season Premiere & Weekly Air Schedule Tracking
   nextAirDate?: string; // Formatted as DD-MM-YYYY (e.g. "15-10-2026")

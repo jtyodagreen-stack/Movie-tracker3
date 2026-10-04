@@ -166,12 +166,19 @@ export default function Navbar({
   useEffect(() => {
     const handleOnline = () => setIsOnlineState(true);
     const handleOffline = () => setIsOnlineState(false);
+    const handleCloseMenu = () => {
+      setIsMobileMenuOpen(false);
+      setShowUserMenu(false);
+      setShowAccMenu(false);
+    };
     window.addEventListener('online', handleOnline);
     window.addEventListener('offline', handleOffline);
+    window.addEventListener('close-mobile-menu', handleCloseMenu);
     setIsOnlineState(typeof navigator !== 'undefined' ? navigator.onLine : true);
     return () => {
       window.removeEventListener('online', handleOnline);
       window.removeEventListener('offline', handleOffline);
+      window.removeEventListener('close-mobile-menu', handleCloseMenu);
     };
   }, []);
 
@@ -559,9 +566,9 @@ export default function Navbar({
             </div>
           </button>
 
-          {/* DESKTOP Navigation Links (xl: >= 1280px) */}
+          {/* DESKTOP Navigation Links (lg: >= 1024px) */}
           {sheetConnected && (
-            <nav className="hidden xl:flex items-center gap-1 text-sm font-medium shrink-0">
+            <nav className="hidden lg:flex items-center gap-0.5 text-xs lg:text-sm font-medium shrink-0">
             {/* ALL PLATFORMS DROPDOWN MENU */}
             <div
               className="relative"

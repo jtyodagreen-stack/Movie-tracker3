@@ -71,5 +71,9 @@ service cloud.firestore {
       allow update: if false;
       allow delete: if false;
     }
+
+    match /sync-control/{docId} {
+      allow read, write: if isSignedIn();
+    }
   }
 }

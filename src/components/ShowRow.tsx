@@ -27,11 +27,12 @@ interface ShowRowProps {
   onIncrementEpisode: (show: ShowItem) => void;
   onToggleStatus: (show: ShowItem) => void;
   onTitleClick?: () => void;
-  onHoverEnter?: (show: ShowItem, rect: { top: number; left: number; width: number; height: number }) => void;
+  onHoverEnter?: (show: ShowItem, rect: { top: number; left: number; width: number; height: number }, shelf?: string) => void;
   onHoverLeave?: () => void;
   emptyState?: ShowRowEmptyState;
   viewerColors?: Record<string, string>;
   headerAction?: React.ReactNode;
+  showNewBadge?: boolean;
 }
 
 export default function ShowRow({
@@ -49,6 +50,7 @@ export default function ShowRow({
   emptyState,
   viewerColors,
   headerAction,
+  showNewBadge,
 }: ShowRowProps) {
   const rowRef = useRef<HTMLDivElement>(null);
 

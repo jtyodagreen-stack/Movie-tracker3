@@ -123,6 +123,18 @@
         }
       },
       "required": ["id", "type", "title", "description", "createdAt"]
+    },
+    "sync_control": {
+      "title": "SyncControl",
+      "description": "Used to trigger instant cross-device UI refreshes",
+      "type": "object",
+      "properties": {
+        "lastUpdated": {
+          "type": "number",
+          "description": "Timestamp of last change"
+        }
+      },
+      "required": ["lastUpdated"]
     }
   },
   "firestore": {
@@ -137,6 +149,10 @@
     "/feedback_reports/{reportId}": {
       "schema": "feedback_report",
       "description": "Stores submitted user feedback and bug reports"
+    },
+    "/sync-control/{docId}": {
+      "schema": "sync_control",
+      "description": "Global sync controller"
     }
   }
 }
