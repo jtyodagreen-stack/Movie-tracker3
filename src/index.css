@@ -99,21 +99,6 @@ a,
   -webkit-tap-highlight-color: transparent;
 }
 
-/* Force NEW Badge visible on desktop + iOS/mobile — never hide on mobile */
-.showflix-new-badge,
-.new-badge-force-visible {
-  display: inline-flex !important;
-  visibility: visible !important;
-  opacity: 1 !important;
-  flex-shrink: 0 !important;
-  z-index: 30 !important;
-  pointer-events: auto !important;
-  background-color: #E50914 !important;
-  color: #ffffff !important;
-  border-color: #ff4d4d !important;
-  box-sizing: border-box !important;
-}
-
 /* Fix for WebKit and iOS date inputs and select elements bursting outside container */
 input[type="date"],
 input[type="text"],

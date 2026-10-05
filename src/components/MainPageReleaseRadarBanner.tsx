@@ -2,7 +2,7 @@ import { useState, useEffect, useMemo, useRef } from 'react';
 import { Sparkles, Clock, CheckCircle2, ChevronLeft, ChevronRight } from 'lucide-react';
 import { ShowItem } from '../types';
 import { getOptimizedPoster, getOptimizedBackdrop } from '../utils/imageOptimizer';
-import { parseAnyDate, formatToDDMMYYYY } from '../utils/dateUtils';
+import { parseAnyDate, formatToDDMMYYYY, formatToLocalDisplay } from '../utils/dateUtils';
 import { checkAndTrigger24hNotifications, getEffectiveReleaseInfo, isShowOutNow } from '../services/notificationService';
 
 interface MainPageReleaseRadarBannerProps {
@@ -39,29 +39,48 @@ export default function MainPageReleaseRadarBanner({
   const upcomingList = useMemo(() => {
     if (!shows || shows.length === 0) return [];
 
+    const nowMs = now.getTime();
+
     const parsed = shows
-      .filter((s) => Boolean(s.releaseDate || s.releaseNote || s.nextAirDate))
+      .filter((s) => Boolean(s.releaseDate || s.releaseNote || s.nextAirDate || s.nextAirTimestamp || s.lastAirTimestamp))
       .map((s) => {
         const eff = getEffectiveReleaseInfo(s);
+        const targetDate = eff.isOut && eff.upcomingEpisode?.timestamp
+          ? new Date(eff.upcomingEpisode.timestamp)
+          : (eff.date || parseShowDate(eff.formattedDateStr || s.releaseDate || s.nextAirDate));
         return {
           ...s,
-          parsedDate: eff && eff.timestamp !== null ? new Date(eff.timestamp) : parseShowDate(s.releaseDate || s.nextAirDate),
-          effectiveFormattedDate: eff?.formattedDateStr,
+          effectiveInfo: eff,
+          parsedDate: targetDate,
+          effectiveFormattedDate: eff.formattedDateStr,
         };
+      })
+      .filter((s) => {
+        // Keep titles that have an active/future date OR an unexpired "OUT NOW" window OR a custom note
+        if (!s.effectiveInfo.timestamp && s.releaseNote) return true;
+        if (!s.effectiveInfo.timestamp && !s.effectiveInfo.outNowTimestamp) return false;
+        if (s.effectiveInfo.isPastWindow) return false; // Filter out expired dates
+        return true;
       });
 
     return parsed.sort((a, b) => {
-      const nowMs = now.getTime();
-      const timeA = a.parsedDate ? a.parsedDate.getTime() : nowMs + 86400000 * 365;
-      const timeB = b.parsedDate ? b.parsedDate.getTime() : nowMs + 86400000 * 365;
+      const aIsOut = a.effectiveInfo.isOut;
+      const bIsOut = b.effectiveInfo.isOut;
 
-      // Future dates first, closest date first
-      const aIsFuture = timeA >= nowMs - 24 * 60 * 60 * 1000;
-      const bIsFuture = timeB >= nowMs - 24 * 60 * 60 * 1000;
+      // 1. Active "OUT NOW" releases first
+      if (aIsOut && !bIsOut) return -1;
+      if (!aIsOut && bIsOut) return 1;
 
-      if (aIsFuture && !bIsFuture) return -1;
-      if (!aIsFuture && bIsFuture) return 1;
+      // If both are OUT NOW, sort by release time (latest release first)
+      if (aIsOut && bIsOut) {
+        const tsA = a.effectiveInfo.outNowTimestamp || a.effectiveInfo.timestamp || 0;
+        const tsB = b.effectiveInfo.outNowTimestamp || b.effectiveInfo.timestamp || 0;
+        return tsB - tsA;
+      }
 
+      // 2. Upcoming future releases: Sort strictly by NEAREST date/time FIRST (soonest at TOP → furthest at BOTTOM)
+      const timeA = a.effectiveInfo.timestamp ?? (nowMs + 86400000 * 365);
+      const timeB = b.effectiveInfo.timestamp ?? (nowMs + 86400000 * 365);
       return timeA - timeB;
     });
   }, [shows, now]);
@@ -75,6 +94,12 @@ export default function MainPageReleaseRadarBanner({
     if (upcomingList.length === 0) return null;
     return upcomingList[activeIndex] || null;
   }, [upcomingList, activeIndex]);
+
+  // Reset index to 0 when the top upcoming item changes (e.g. new soonest release added or sorted)
+  const firstItemId = upcomingList[0]?.id;
+  useEffect(() => {
+    setCurrentIndex(0);
+  }, [firstItemId]);
 
   // Auto-slideshow for Countdown Banner (12 seconds per slide, pausing on hover/interaction)
   useEffect(() => {
@@ -101,7 +126,9 @@ export default function MainPageReleaseRadarBanner({
   };
 
   const isFeaturedShowReleased = useMemo(() => {
-    if (!activeShow || !activeShow.parsedDate) return false;
+    if (!activeShow) return false;
+    if (activeShow.effectiveInfo?.isOut) return true;
+    if (!activeShow.parsedDate) return false;
     return activeShow.parsedDate.getTime() - now.getTime() <= 0;
   }, [activeShow, now]);
 
@@ -156,7 +183,7 @@ export default function MainPageReleaseRadarBanner({
   };
 
   return (
-    <section className="max-w-7xl mx-auto px-2 sm:px-6 lg:px-8 my-6">
+    <section className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 my-6">
       <div
         onMouseEnter={() => setIsPaused(true)}
         onMouseLeave={() => setIsPaused(false)}
@@ -198,9 +225,15 @@ export default function MainPageReleaseRadarBanner({
 
             <div className="space-y-1.5 min-w-0 flex-1">
               <div className="flex items-center gap-2 flex-wrap">
-                <span className="text-[10px] font-black px-2 py-0.5 rounded bg-amber-500 text-black uppercase tracking-wider flex items-center gap-1 shadow">
-                  <Clock className="w-3 h-3" /> Live Premiere Countdown
-                </span>
+                {activeShow.effectiveInfo.isOut ? (
+                  <span className="text-[10px] font-black px-2.5 py-0.5 rounded bg-emerald-500 text-black uppercase tracking-wider flex items-center gap-1 shadow animate-pulse">
+                    🎉 Episode Out Now!
+                  </span>
+                ) : (
+                  <span className="text-[10px] font-black px-2 py-0.5 rounded bg-amber-500 text-black uppercase tracking-wider flex items-center gap-1 shadow">
+                    <Clock className="w-3 h-3" /> Live Premiere Countdown
+                  </span>
+                )}
 
                 {activeShow.platform && (
                   <span className="text-[10px] font-bold px-2 py-0.5 rounded bg-zinc-800 text-zinc-300 border border-zinc-700">
@@ -217,24 +250,28 @@ export default function MainPageReleaseRadarBanner({
                 {activeShow.title}
               </h3>
 
-              <p className="text-xs text-amber-300/90 font-medium flex items-center gap-1.5">
-                <Sparkles className="w-3.5 h-3.5 text-amber-400 shrink-0" />
-                <span>
-                  {activeShow.effectiveFormattedDate
-                    ? `Target Premiere: ${activeShow.effectiveFormattedDate}`
-                    : activeShow.releaseNote ||
-                      (activeShow.parsedDate
-                        ? `Target Premiere: ${formatToDDMMYYYY(activeShow.parsedDate)}${
-                            activeShow.parsedDate.getHours() !== 0 ||
-                            activeShow.parsedDate.getMinutes() !== 0
-                              ? ` at ${String(activeShow.parsedDate.getHours()).padStart(2, '0')}:${String(
-                                  activeShow.parsedDate.getMinutes()
-                                ).padStart(2, '0')}`
-                              : ''
-                          }`
-                        : 'Airing Soon')}
-                </span>
-              </p>
+              {activeShow.effectiveInfo.isOut ? (
+                <p className="text-xs text-emerald-300 font-medium flex items-center gap-1.5">
+                  <Sparkles className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                  <span>
+                    {activeShow.effectiveInfo.outNowEpisode?.season && activeShow.effectiveInfo.outNowEpisode?.number
+                      ? `S${activeShow.effectiveInfo.outNowEpisode.season} E${activeShow.effectiveInfo.outNowEpisode.number}${activeShow.effectiveInfo.outNowEpisode.name ? ` • ${activeShow.effectiveInfo.outNowEpisode.name}` : ''} — OUT NOW!`
+                      : `Aired ${activeShow.effectiveFormattedDate || (activeShow.parsedDate ? formatToLocalDisplay(activeShow.parsedDate) : '')} — OUT NOW!`}
+                  </span>
+                </p>
+              ) : (
+                <p className="text-xs text-amber-300/90 font-medium flex items-center gap-1.5">
+                  <Sparkles className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+                  <span>
+                    {activeShow.effectiveFormattedDate
+                      ? `Target Premiere: ${activeShow.effectiveFormattedDate}`
+                      : activeShow.releaseNote ||
+                        (activeShow.parsedDate
+                          ? `Target Premiere: ${formatToLocalDisplay(activeShow.parsedDate)}`
+                          : 'Airing Soon')}
+                  </span>
+                </p>
+              )}
             </div>
           </div>
 
@@ -242,8 +279,11 @@ export default function MainPageReleaseRadarBanner({
           <div className="flex items-center w-full lg:w-auto justify-center lg:justify-end">
             {activeShow.parsedDate ? (
               (() => {
+                const isOut = activeShow.effectiveInfo.isOut;
+                const hasUpcoming = Boolean(activeShow.effectiveInfo.upcomingEpisode?.timestamp);
                 const clock = getCountdownClock(activeShow.parsedDate);
-                if (clock.isPast) {
+
+                if (isOut && !hasUpcoming) {
                   return (
                     <div className="flex items-center gap-2.5 bg-zinc-950/90 px-5 py-3.5 rounded-2xl border border-emerald-500/50 animate-out-now-flash shadow-xl">
                       <CheckCircle2 className="w-6 h-6 text-emerald-400 animate-pulse" />
@@ -254,34 +294,63 @@ export default function MainPageReleaseRadarBanner({
                   );
                 }
 
+                if (clock.isPast && !hasUpcoming) {
+                  return (
+                    <div className="flex items-center gap-2.5 bg-zinc-950/90 px-5 py-3.5 rounded-2xl border border-emerald-500/50 animate-out-now-flash shadow-xl">
+                      <CheckCircle2 className="w-6 h-6 text-emerald-400 animate-pulse" />
+                      <span className="text-base sm:text-xl font-black text-emerald-300 uppercase tracking-wider drop-shadow-[0_0_10px_rgba(52,211,153,0.5)]">
+                        OUT NOW ON {activeShow.platform || 'Streaming'}!
+                      </span>
+                    </div>
+                  );
+                }
+
+                const upcomingEp = activeShow.effectiveInfo.upcomingEpisode;
+
                 return (
-                  <div translate="no" className="notranslate flex items-center gap-2 sm:gap-3 md:gap-4 bg-zinc-950/90 px-3 sm:px-5 py-3 sm:py-3.5 rounded-2xl border border-amber-500/30 shadow-xl">
-                    <div className="flex flex-col items-center px-1.5 sm:px-3">
-                      <span className="text-3xl sm:text-4xl md:text-5xl font-black text-amber-400 font-mono tracking-tight">
-                        {String(clock.days).padStart(2, '0')}
-                      </span>
-                      <span className="text-[11px] sm:text-xs uppercase font-extrabold text-zinc-400 tracking-wider">Days</span>
-                    </div>
-                    <span className="text-2xl sm:text-3xl md:text-4xl font-black text-zinc-600 pb-3">:</span>
-                    <div className="flex flex-col items-center px-1.5 sm:px-3">
-                      <span className="text-3xl sm:text-4xl md:text-5xl font-black text-white font-mono tracking-tight">
-                        {String(clock.hours).padStart(2, '0')}
-                      </span>
-                      <span className="text-[11px] sm:text-xs uppercase font-extrabold text-zinc-400 tracking-wider">Hours</span>
-                    </div>
-                    <span className="text-2xl sm:text-3xl md:text-4xl font-black text-zinc-600 pb-3">:</span>
-                    <div className="flex flex-col items-center px-1.5 sm:px-3">
-                      <span className="text-3xl sm:text-4xl md:text-5xl font-black text-white font-mono tracking-tight">
-                        {String(clock.minutes).padStart(2, '0')}
-                      </span>
-                      <span className="text-[11px] sm:text-xs uppercase font-extrabold text-zinc-400 tracking-wider">Mins</span>
-                    </div>
-                    <span className="text-2xl sm:text-3xl md:text-4xl font-black text-zinc-600 pb-3">:</span>
-                    <div className="flex flex-col items-center px-1.5 sm:px-3">
-                      <span className="text-3xl sm:text-4xl md:text-5xl font-black font-mono tracking-tight animate-pulse" style={{ color: '#ef4444' }}>
-                        {String(clock.seconds).padStart(2, '0')}
-                      </span>
-                      <span className="text-[11px] sm:text-xs uppercase font-extrabold tracking-wider" style={{ color: '#f87171' }}>Secs</span>
+                  <div className="flex flex-col items-center lg:items-end gap-2 w-full lg:w-auto">
+                    {isOut && (
+                      <div className="flex items-center gap-2 bg-zinc-950/95 px-3 sm:px-4 py-1.5 rounded-xl border border-emerald-500/50 shadow-md">
+                        <CheckCircle2 className="w-4 h-4 text-emerald-400 animate-pulse shrink-0" />
+                        <span className="text-xs sm:text-sm font-black text-emerald-300 uppercase tracking-wider">
+                          OUT NOW ON {activeShow.platform || 'Streaming'}!
+                        </span>
+                        {upcomingEp?.season && upcomingEp?.number && (
+                          <span className="text-[11px] font-bold text-amber-400 border-l border-zinc-700 pl-2">
+                            Next: S{upcomingEp.season} E{upcomingEp.number}
+                          </span>
+                        )}
+                      </div>
+                    )}
+
+                    <div translate="no" className="notranslate flex items-center gap-2 sm:gap-3 md:gap-4 bg-zinc-950/90 px-3 sm:px-5 py-3 sm:py-3.5 rounded-2xl border border-amber-500/30 shadow-xl">
+                      <div className="flex flex-col items-center px-1.5 sm:px-3">
+                        <span className="text-3xl sm:text-4xl md:text-5xl font-black text-amber-400 font-mono tracking-tight">
+                          {String(clock.days).padStart(2, '0')}
+                        </span>
+                        <span className="text-[11px] sm:text-xs uppercase font-extrabold text-zinc-400 tracking-wider">Days</span>
+                      </div>
+                      <span className="text-2xl sm:text-3xl md:text-4xl font-black text-zinc-600 pb-3">:</span>
+                      <div className="flex flex-col items-center px-1.5 sm:px-3">
+                        <span className="text-3xl sm:text-4xl md:text-5xl font-black text-white font-mono tracking-tight">
+                          {String(clock.hours).padStart(2, '0')}
+                        </span>
+                        <span className="text-[11px] sm:text-xs uppercase font-extrabold text-zinc-400 tracking-wider">Hours</span>
+                      </div>
+                      <span className="text-2xl sm:text-3xl md:text-4xl font-black text-zinc-600 pb-3">:</span>
+                      <div className="flex flex-col items-center px-1.5 sm:px-3">
+                        <span className="text-3xl sm:text-4xl md:text-5xl font-black text-white font-mono tracking-tight">
+                          {String(clock.minutes).padStart(2, '0')}
+                        </span>
+                        <span className="text-[11px] sm:text-xs uppercase font-extrabold text-zinc-400 tracking-wider">Mins</span>
+                      </div>
+                      <span className="text-2xl sm:text-3xl md:text-4xl font-black text-zinc-600 pb-3">:</span>
+                      <div className="flex flex-col items-center px-1.5 sm:px-3">
+                        <span className="text-3xl sm:text-4xl md:text-5xl font-black font-mono tracking-tight animate-pulse" style={{ color: '#ef4444' }}>
+                          {String(clock.seconds).padStart(2, '0')}
+                        </span>
+                        <span className="text-[11px] sm:text-xs uppercase font-extrabold tracking-wider" style={{ color: '#f87171' }}>Secs</span>
+                      </div>
                     </div>
                   </div>
                 );

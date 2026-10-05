@@ -28,6 +28,7 @@ initThemeOnStartup();
 import {
   fetchSpreadsheetDetails,
   fetchMultipleSheetRows,
+  fetchAllSheetDataBatch,
   updateSheetRow,
   appendSheetRow,
   deleteSheetRow,
@@ -73,8 +74,10 @@ import {
   enableShowNotificationSilent,
   getAlertIntervals,
   saveAlertIntervals,
-  isShowOutNow
+  isShowOutNow,
+  getEffectiveReleaseInfo
 } from './services/notificationService';
+import { fetchLiveTvMazeInfo, getTvMazeEpisodeTimestamp } from './services/tvMazeService';
 import { OfflineIndicator } from './components/OfflineIndicator';
 import { getViewerColor } from './utils/profileColors';
 import {
@@ -84,7 +87,7 @@ import {
   getOfflineQueue,
   clearOfflineQueue,
 } from './services/offlineQueue';
-import { calculateShowProgress, compareByAddedRank, compareRecentlyAdded, rebuildSheetAddedRanks } from './utils/showMetrics';
+import { calculateShowProgress, compareByAddedRank, compareRecentlyAdded, rebuildSheetAddedRanks, deduplicateShowsByTitle, normalizeTitleForComparison, isWishlistShow } from './utils/showMetrics';
 import { parseAnyDate, getTodayDDMMYYYY } from './utils/dateUtils';
 import { PieChart, Pie, Cell, ResponsiveContainer } from 'recharts';
 
@@ -139,7 +142,23 @@ function haveShowsChanged(oldShows: ShowItem[], newShows: ShowItem[]): boolean {
 }
 
 export default function App() {
-  const [showInitialLoadingScreen, setShowInitialLoadingScreen] = useState(true);
+  const deviceIdRef = useRef<string>(
+    'dev_' + Math.random().toString(36).substring(2, 9) + '_' + Date.now()
+  );
+  const deletedShowKeysRef = useRef<Set<string>>((() => {
+    try {
+      const saved = localStorage.getItem('showflix_deleted_tombstones');
+      if (saved) {
+        const keys = JSON.parse(saved);
+        const cleanKeys = Array.isArray(keys) ? keys.filter((k) => typeof k === 'string' && k.startsWith('show-')) : [];
+        return new Set<string>(cleanKeys);
+      }
+    } catch {}
+    return new Set<string>();
+  })());
+  const movedShowsRef = useRef<Map<string, { show: ShowItem; timestamp: number }>>(new Map());
+  const lastSyncSheetShowsRef = useRef<{ master: ShowItem[]; wishlist: ShowItem[] }>({ master: [], wishlist: [] });
+
   const [user, setUser] = useState<User | null>(() => auth.currentUser || DEFAULT_PROFILE_USER);
   const [shows, setShows] = useState<ShowItem[]>(() => {
     try {
@@ -151,7 +170,19 @@ export default function App() {
         return [];
       }
       if (cache?.shows && cache.shows.length > 0) {
-        return rebuildSheetAddedRanks(cache.shows).sort(compareByAddedRank);
+        let savedTombstones = new Set<string>();
+        try {
+          const rawT = localStorage.getItem('showflix_deleted_tombstones');
+          if (rawT) savedTombstones = new Set(JSON.parse(rawT));
+        } catch {}
+        const aliveShows = cache.shows.filter((s: ShowItem) => {
+          if (!s) return false;
+          if (savedTombstones.has(s.id)) return false;
+          const norm = normalizeTitleForComparison(s.title);
+          if (norm && savedTombstones.has(norm)) return false;
+          return true;
+        });
+        return deduplicateShowsByTitle(rebuildSheetAddedRanks(aliveShows)).sort(compareByAddedRank);
       }
     } catch {}
     return [];
@@ -191,6 +222,7 @@ export default function App() {
   }, []);
 
   const [searchQuery, setSearchQuery] = useState('');
+  const [showInitialLoadingScreen, setShowInitialLoadingScreen] = useState(true);
   const [activeFilter, setActiveFilter] = useState('all');
   const [customPlatforms] = useState<string[]>([]);
   const [accessibilitySettings, setAccessibilitySettings] = useState<AccessibilitySettings>(() => {
@@ -303,6 +335,8 @@ export default function App() {
   const [showStatsModal, setShowStatsModal] = useState(false);
   const [showDecisionWheelModal, setShowDecisionWheelModal] = useState(false);
   const [showScrollTop, setShowScrollTop] = useState(false);
+  const [showDiagnosticConsole, setShowDiagnosticConsole] = useState(false);
+  const [diagnosticQuery, setDiagnosticQuery] = useState('');
 
   const handleOpenSettingsModal = useCallback((
     tab: 'all' | 'user' | 'sync' | 'acc' | 'theme' | 'data' | 'help' | 'alerts' | 'stats' = 'sync',
@@ -434,6 +468,21 @@ export default function App() {
       return {};
     }
   });
+  const [viewerAvatars, setViewerAvatars] = useState<Record<string, string>>(() => {
+    try {
+      const cached = localStorage.getItem('showflix_viewer_avatars');
+      return cached ? JSON.parse(cached) : {};
+    } catch {
+      return {};
+    }
+  });
+
+  const handleUpdateViewerAvatars = (avatars: Record<string, string>) => {
+    setViewerAvatars(avatars);
+    try {
+      localStorage.setItem('showflix_viewer_avatars', JSON.stringify(avatars));
+    } catch {}
+  };
   const [activeProfile, setActiveProfile] = useState<string>(() => {
     try {
       return localStorage.getItem('showflix_active_profile') || '';
@@ -477,30 +526,126 @@ export default function App() {
     typeof navigator !== 'undefined' ? navigator.onLine : true
   );
   const lastRemoteSyncRef = useRef<number>(0);
-  const syncGoogleSheetRef = useRef<((trigger: 'first_open' | 'return' | 'force') => Promise<void>) | null>(null);
+  const syncGoogleSheetRef = useRef<((trigger: 'first_open' | 'return' | 'force' | 'auto_poll') => Promise<void>) | null>(null);
+  const inFlightShowsRef = useRef<Map<string, { show: ShowItem; timestamp: number }>>(new Map());
+  const lastUserActionTimestampRef = useRef<number>(0);
 
+  // Real-Time Cross-Device Sync Listener: Instantly removes deleted shows & updates state across phone and desktop
   useEffect(() => {
     if (!db) return;
     const syncDoc = doc(db, 'sync-control', 'global');
     return onSnapshot(syncDoc, (snap) => {
       const data = snap.data();
-      if (data && data.lastUpdated > lastRemoteSyncRef.current) {
+      if (!data) return;
+
+      const isFromOtherDevice = !data.deviceId || data.deviceId !== deviceIdRef.current;
+
+      // Ingest remote tombstones - only keep keys starting with "show-"
+      if (Array.isArray(data.deletedKeys)) {
+        data.deletedKeys.forEach((k: string) => {
+          if (k && k.startsWith('show-')) {
+            deletedShowKeysRef.current.add(k);
+          }
+        });
+        try {
+          localStorage.setItem('showflix_deleted_tombstones', JSON.stringify(Array.from(deletedShowKeysRef.current).slice(-200)));
+        } catch {}
+      }
+
+      // Real-time instant deletion broadcast received from other device
+      if (data.action === 'DELETE' && data.deletedShowId) {
+        deletedShowKeysRef.current.add(data.deletedShowId);
+
+        // Remove from screen immediately on other device!
+        setShows((prev) => {
+          const next = prev.filter((s) => s.id !== data.deletedShowId);
+          setAppDataCache({ shows: next });
+          return next;
+        });
+
+        // Close detail modal if the deleted show was currently open on this device
+        setSelectedShow((prev) => {
+          if (!prev) return null;
+          if (prev.id === data.deletedShowId) return null;
+          return prev;
+        });
+      }
+
+      // Real-time instant addition broadcast received from other device
+      if (data.action === 'ADD' && data.addedShow && isFromOtherDevice) {
+        const added = data.addedShow;
+        const norm = normalizeTitleForComparison(added.title);
+        deletedShowKeysRef.current.delete(added.id);
+        if (norm) deletedShowKeysRef.current.delete(norm);
+        try {
+          localStorage.setItem('showflix_deleted_tombstones', JSON.stringify(Array.from(deletedShowKeysRef.current).slice(-200)));
+        } catch {}
+
+        const addedWho = String(added.who || '').trim().toLowerCase();
+        setShows((prev) => {
+          if (
+            prev.some(
+              (s) =>
+                s.id === added.id ||
+                (norm &&
+                  normalizeTitleForComparison(s.title) === norm &&
+                  String(s.who || '').trim().toLowerCase() === addedWho)
+            )
+          ) {
+            return prev;
+          }
+          const next = deduplicateShowsByTitle([added, ...prev]).sort(compareByAddedRank);
+          setAppDataCache({ shows: next });
+          return next;
+        });
+      }
+
+      // Trigger background sync if a newer timestamp arrived from another device
+      if (data.lastUpdated && data.lastUpdated > lastRemoteSyncRef.current) {
         lastRemoteSyncRef.current = data.lastUpdated;
-        if (syncGoogleSheetRef.current) {
+        if (isFromOtherDevice && syncGoogleSheetRef.current) {
           syncGoogleSheetRef.current('force');
         }
       }
     });
   }, []);
 
-  const updateRemoteSync = async () => {
+  const updateRemoteSync = async (extraPayload: Record<string, any> = {}) => {
     if (!db) return;
     try {
-      await setDoc(doc(db, 'sync-control', 'global'), { lastUpdated: Date.now() });
+      const payload = JSON.parse(JSON.stringify({
+        lastUpdated: Date.now(),
+        deviceId: deviceIdRef.current,
+        ...extraPayload,
+      }));
+      await setDoc(doc(db, 'sync-control', 'global'), payload, { merge: true });
     } catch (e) {
       console.error('Failed to trigger remote sync:', e);
     }
   };
+
+  const broadcastDeleteShow = useCallback(async (show: ShowItem) => {
+    if (!db) return;
+    deletedShowKeysRef.current.add(show.id);
+    try {
+      localStorage.setItem('showflix_deleted_tombstones', JSON.stringify(Array.from(deletedShowKeysRef.current).slice(-200)));
+    } catch {}
+
+    const keyList = Array.from(deletedShowKeysRef.current).slice(-150);
+    try {
+      const payload = JSON.parse(JSON.stringify({
+        lastUpdated: Date.now(),
+        action: 'DELETE',
+        deletedShowId: show.id,
+        deletedTitle: show.title,
+        deviceId: deviceIdRef.current,
+        deletedKeys: keyList,
+      }));
+      await setDoc(doc(db, 'sync-control', 'global'), payload, { merge: true });
+    } catch (e) {
+      console.warn('Failed to broadcast real-time delete:', e);
+    }
+  }, []);
 
   useEffect(() => {
     const handleOnline = () => {
@@ -737,6 +882,7 @@ export default function App() {
 
   // Helper: auto-sync updated show to Google Sheet (reliable non-blocking live update with offline queue)
   const syncShowToSheet = useCallback(async (updatedShow: ShowItem, isExplicitSave = false) => {
+    lastUserActionTimestampRef.current = Date.now();
     if (!navigator.onLine) {
       queueOfflineAction('UPDATE_SHOW', updatedShow);
       showToast(`📴 Offline: "${updatedShow.title}" updated locally — will sync when online`);
@@ -830,7 +976,7 @@ export default function App() {
           setShows((prev) =>
             prev.map((s) =>
               s.id === updatedShow.id
-                ? { ...s, rowNumber: rowNum, sheetTabName: targetTab, releaseDate: updatedShow.releaseDate, releaseNote: updatedShow.releaseNote }
+                ? { ...updatedShow, rowNumber: rowNum, sheetTabName: targetTab }
                 : s
             )
           );
@@ -851,7 +997,7 @@ export default function App() {
       setShows((prev) =>
         prev.map((s) =>
           s.id === updatedShow.id
-            ? { ...s, rowNumber: rowNum, sheetTabName: targetTab, releaseDate: updatedShow.releaseDate, releaseNote: updatedShow.releaseNote }
+            ? { ...updatedShow, rowNumber: rowNum, sheetTabName: targetTab }
             : s
         )
       );
@@ -915,6 +1061,8 @@ export default function App() {
         } else if (action.type === 'UPDATE_SHOW') {
           await syncShowToSheet(action.payload, true);
         }
+        // Add 500ms delay between sequential batch writes
+        await new Promise((resolve) => setTimeout(resolve, 500));
       } catch (e) {
         console.error('Failed to sync offline action:', action, e);
       }
@@ -923,16 +1071,24 @@ export default function App() {
     showToast('✨ Offline changes synced with Google Sheet!');
   }, [spreadsheetId, sheetName, wishlistSheetName, sheetHeaders, syncShowToSheet, showToast]);
 
-  // Fresh, Simple & Reliable Google Sheets Sync: THREE TRIGGERS ONLY
+  // Fresh, Simple & Reliable Google Sheets Sync: Automatic Real-Time Sync & Responsive Triggers
   const isSyncInProgressRef = useRef(false);
+  const lastSyncTimestampRef = useRef<number>(0);
   const syncGoogleSheet = useCallback(
-    async (trigger: 'first_open' | 'return' | 'force') => {
+    async (trigger: 'first_open' | 'return' | 'force' | 'auto_poll') => {
       // Prevent overlapping concurrent sync executions
       if (isSyncInProgressRef.current) return;
 
-      // Offline check: Show honest feedback
+      // Throttle return triggers if synced within 1 second
+      if (trigger === 'return' && Date.now() - lastSyncTimestampRef.current < 1000) {
+        return;
+      }
+
+      // Offline check: Show honest feedback for user-initiated triggers
       if (!navigator.onLine || !isOnline) {
-        showToast("🔌 Offline — will sync when you're back online");
+        if (trigger === 'force' || trigger === 'first_open') {
+          showToast("🔌 Offline — will sync when you're back online");
+        }
         return;
       }
 
@@ -950,13 +1106,8 @@ export default function App() {
       if (!currentSheetId) return;
 
       isSyncInProgressRef.current = true;
-      setIsSyncing(true);
-
-      // Trigger 1 (First Open) & Trigger 3 (Force Re-Sync): "⏱️ Syncing..."
-      // Trigger 2 (Return to Tab): "🔍 Checking for updates..."
-      if (trigger === 'return') {
-        showToast('🔍 Checking for updates...');
-      } else {
+      if (trigger === 'force') {
+        setIsSyncing(true);
         showToast('⏱️ Syncing...');
       }
 
@@ -967,9 +1118,11 @@ export default function App() {
         }
 
         if (!token) {
-          setCachedAccessToken(null);
-          showToast('⚠️ Google Sheets session expired. Please reconnect.');
-          handleOpenSettingsModal('sync');
+          if (trigger === 'force' || trigger === 'first_open') {
+            setCachedAccessToken(null);
+            showToast('⚠️ Google Sheets session expired. Please reconnect.');
+            handleOpenSettingsModal('sync');
+          }
           return;
         }
 
@@ -989,90 +1142,142 @@ export default function App() {
           { name: currentShowcaseName, isWishlist: false },
         ];
 
-        // Fetch fresh LIVE rows directly from Google Sheet — NO cache, check LIVE Sheet directly
-        const results = await fetchMultipleSheetRows(currentSheetId, tabConfigs, token);
-        const masterParsed = results[currentSheetName] || { shows: [], headers: [], headerRowIndex: 0 };
-        const wishlistParsed = results[currentWishlistName] || { shows: [], headers: [], headerRowIndex: 0 };
-        const showcaseParsed = results[currentShowcaseName] || { shows: [], headers: [], headerRowIndex: 0 };
+        // Determine lists tab name from cached tabs or default to 'Lists'
+        let listsTab = 'Lists';
+        try {
+          const storedTabs = localStorage.getItem('bingebox_available_sheet_tabs');
+          const tabs: string[] = storedTabs ? JSON.parse(storedTabs) : availableTabs;
+          const found = tabs.find((t) => t.toLowerCase().includes('lists'));
+          if (found) listsTab = found;
+        } catch {}
 
-        const combinedShows: ShowItem[] = [
-          ...(masterParsed.shows || []),
-          ...(wishlistParsed.shows || []),
-          ...(showcaseParsed.shows || []),
-        ];
+        // LOAD ALL SHEET DATA IN ONE SINGLE REQUEST (Master + Wishlist + Showcase + Lists)
+        const batchResult = await fetchAllSheetDataBatch(currentSheetId, tabConfigs, token, listsTab);
+        const results = batchResult.sheetResults || {};
+        const masterParsed = results[currentSheetName] || results[Object.keys(results).find(k => !k.toLowerCase().includes('wish') && !k.toLowerCase().includes('showcase')) || ''] || { shows: [], headers: [], headerRowIndex: 0 };
+        const wishlistParsed = results[currentWishlistName] || results[Object.keys(results).find(k => k.toLowerCase().includes('wish')) || ''] || { shows: [], headers: [], headerRowIndex: 0 };
+        const showcaseParsed = results[currentShowcaseName] || results[Object.keys(results).find(k => k.toLowerCase().includes('showcase') || k.toLowerCase().includes('featured')) || ''] || { shows: [], headers: [], headerRowIndex: 0 };
+
+        const nowStr = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: true });
+        lastSyncTimestampRef.current = Date.now();
+
+        // Process custom viewers if returned in the single batch
+        if (batchResult.viewersResult) {
+          if (batchResult.viewersResult.viewers && batchResult.viewersResult.viewers.length > 0) {
+            setCustomViewers(batchResult.viewersResult.viewers);
+            localStorage.setItem('bingebox_custom_viewers', JSON.stringify(batchResult.viewersResult.viewers));
+          }
+          if (batchResult.viewersResult.colors && Object.keys(batchResult.viewersResult.colors).length > 0) {
+            setViewerColors(batchResult.viewersResult.colors);
+            localStorage.setItem('showflix_viewer_colors', JSON.stringify(batchResult.viewersResult.colors));
+          }
+        }
+
+        // 1. Separate results per category
+        const masterShows = masterParsed.shows || [];
+        const wishlistShows = wishlistParsed.shows || [];
+        const showcaseShows = showcaseParsed.shows || [];
+
+        // Save for live diagnostics
+        lastSyncSheetShowsRef.current = {
+          master: masterShows,
+          wishlist: wishlistShows,
+        };
+
+        // 2. Clean and retrieve in-flight optimistic additions/mutations
+        const nowMs = Date.now();
+        // Clean up expired movedShows entries
+        movedShowsRef.current.forEach((val, key) => {
+          if (nowMs - val.timestamp > 45000) {
+            movedShowsRef.current.delete(key);
+          }
+        });
+
+        const pendingInFlight: ShowItem[] = [];
+        inFlightShowsRef.current.forEach((val, id) => {
+          if (nowMs - val.timestamp > 45000) {
+            inFlightShowsRef.current.delete(id);
+          } else {
+            const norm = normalizeTitleForComparison(val.show.title);
+            const inMaster = masterShows.some(
+              (s) => s.id === val.show.id || (norm && normalizeTitleForComparison(s.title) === norm)
+            );
+            const inWishlist = wishlistShows.some(
+              (s) => s.id === val.show.id || (norm && normalizeTitleForComparison(s.title) === norm)
+            );
+            if (inMaster || inWishlist) {
+              inFlightShowsRef.current.delete(id);
+            } else {
+              pendingInFlight.push(val.show);
+            }
+          }
+        });
 
         // Clear any stale local session caches to keep Preview and iOS 100% in sync
         try {
           localStorage.removeItem('bingebox_session_added');
         } catch {}
 
-        // Rebuild addedRank directly from Google Sheet on every load to clear iOS cache
-        const rawShows = Array.from(new Map(combinedShows.map((s) => [s.id, s])).values());
-        const finalShows = rebuildSheetAddedRanks(rawShows);
+        let isChanged = false;
+        setShows((prev) => {
+          // Master tab = EVERY row in Master tab, NO EXCEPTIONS, NO FILTERS
+          const finalMaster = masterShows.map((s) => ({
+            ...s,
+            isWishlist: false,
+          }));
 
-        // Sort ONLY by addedRank number (highest = newest = first). IGNORE all timestamps/dates.
-        finalShows.sort(compareByAddedRank);
+          // Wishlist tab = EVERY row in Wishlist tab, NO EXCEPTIONS, NO FILTERS
+          const finalWishlist = wishlistShows.map((s) => ({
+            ...s,
+            isWishlist: true,
+          }));
 
-        const isChanged = haveShowsChanged(showsRef.current, finalShows);
-        const nowStr = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: true });
+          // Direct chronological/row-based representation
+          const sortedMaster = rebuildSheetAddedRanks(finalMaster);
+          const sortedWishlist = rebuildSheetAddedRanks(finalWishlist);
+          sortedMaster.sort(compareByAddedRank);
+          sortedWishlist.sort(compareByAddedRank);
 
-        if (isChanged || showsRef.current.length === 0) {
-          setShows(finalShows);
-          if (masterParsed.headers && masterParsed.headers.length > 0) {
-            setSheetHeaders(masterParsed.headers);
+          const finalShows = [...sortedMaster, ...sortedWishlist];
+
+          isChanged = haveShowsChanged(prev, finalShows);
+          if (isChanged || prev.length === 0) {
+            setAppDataCache({
+              shows: finalShows,
+              headers: masterParsed.headers,
+              spreadsheetId: currentSheetId,
+              sheetName: currentSheetName,
+              wishlistSheetName: currentWishlistName,
+              showcaseSheetName: currentShowcaseName,
+              customViewers: finalShows.length > 0 ? customViewers : undefined,
+              dataSignature: batchResult.dataSignature,
+            });
+            return finalShows;
           }
-          setAppDataCache({
-            shows: finalShows,
-            headers: masterParsed.headers,
-            spreadsheetId: currentSheetId,
-            sheetName: currentSheetName,
-            wishlistSheetName: currentWishlistName,
-            showcaseSheetName: currentShowcaseName,
-            customViewers: finalShows.length > 0 ? customViewers : undefined,
-          });
+          if (batchResult.dataSignature) {
+            setAppDataCache({ dataSignature: batchResult.dataSignature });
+          }
+          return prev;
+        });
+
+        if (masterParsed.headers && masterParsed.headers.length > 0) {
+          setSheetHeaders(masterParsed.headers);
         }
-
-        // Sync custom viewers if lists tab exists
-        try {
-          const storedTabs = localStorage.getItem('bingebox_available_sheet_tabs');
-          const tabs: string[] = storedTabs ? JSON.parse(storedTabs) : availableTabs;
-          const listsTab = tabs.find((t) => t.toLowerCase().includes('lists'));
-          if (listsTab && currentSheetId && token) {
-            const viewerRes = await fetchCustomViewers(currentSheetId, listsTab, token);
-            if (viewerRes?.viewers && viewerRes.viewers.length > 0) {
-              setCustomViewers(viewerRes.viewers);
-              localStorage.setItem('bingebox_custom_viewers', JSON.stringify(viewerRes.viewers));
-            }
-            if (viewerRes?.colors && Object.keys(viewerRes.colors).length > 0) {
-              setViewerColors(viewerRes.colors);
-              localStorage.setItem('showflix_viewer_colors', JSON.stringify(viewerRes.colors));
-            }
-          }
-        } catch {}
 
         setLastSyncedAt(nowStr);
 
-        // Feedback messaging according to the THREE TRIGGERS:
+        // Feedback messaging according to the triggers:
         if (trigger === 'first_open') {
-          // 1. PAGE FIRST OPENS:
-          // - New data found → "✅ Synced — Last updated: {time}"
-          // - No changes → "✅ Up to date"
           if (isChanged || showsRef.current.length === 0) {
             showToast(`✅ Synced — Last updated: ${nowStr}`);
           } else {
             showToast('✅ Up to date');
           }
-        } else if (trigger === 'return') {
-          // 2. YOU RETURN TO TAB / FOCUS PAGE:
-          // - Changed → refresh + "🔄 Updated"
-          // - Same → quiet, no extra message
+        } else if (trigger === 'return' || trigger === 'auto_poll') {
           if (isChanged) {
-            showToast('🔄 Updated');
+            showToast('🔄 Google Sheet updated');
           }
         } else if (trigger === 'force') {
-          // 3. FORCE RE-SYNC BUTTON:
-          // - Changed → "✅ Synced — Last updated: {time}"
-          // - Same → "✅ Up to date"
           if (isChanged) {
             showToast(`✅ Synced — Last updated: ${nowStr}`);
           } else {
@@ -1080,7 +1285,6 @@ export default function App() {
           }
         }
       } catch (err: any) {
-        console.error('Google Sheets sync error:', err);
         const msg = err?.message || String(err);
         if (
           msg.includes('invalid authentication credentials') ||
@@ -1089,11 +1293,21 @@ export default function App() {
           msg.includes('invalid_grant') ||
           msg.includes('Expected OAuth 2 access token')
         ) {
-          setCachedAccessToken(null);
-          showToast('⚠️ Google Sheets session expired. Please reconnect.');
-          handleOpenSettingsModal('sync');
+          if (trigger === 'force' || trigger === 'first_open') {
+            setCachedAccessToken(null);
+            showToast('⚠️ Google Sheets session expired. Please reconnect.');
+            handleOpenSettingsModal('sync');
+          }
+        } else if (msg.includes('Failed to fetch') || msg.includes('NetworkError') || !isOnline) {
+          console.warn('Google Sheets sync network notice:', msg);
+          if (trigger === 'force') {
+            showToast('📡 Working offline — using cached collection.');
+          }
         } else {
-          showToast(`⚠️ Sync notice: ${msg}`);
+          console.error('Google Sheets sync error:', err);
+          if (trigger === 'force') {
+            showToast(`⚠️ Sync notice: ${msg}`);
+          }
         }
       } finally {
         setIsSyncing(false);
@@ -1286,6 +1500,32 @@ export default function App() {
     };
   }, [spreadsheetId, syncGoogleSheet]);
 
+  // Real-time automatic background polling: Detects any direct Google Sheet changes (edit, delete, add, date, column)
+  useEffect(() => {
+    const activeSheetId =
+      spreadsheetId ||
+      localStorage.getItem('bingebox_spreadsheet_id') ||
+      localStorage.getItem('showflix_spreadsheet_id');
+
+    if (!activeSheetId) return;
+
+    // Fast, lightweight polling every 6 seconds while active and not in an active write operation
+    const pollIntervalMs = 6000;
+    const interval = setInterval(() => {
+      if (document.visibilityState !== 'hidden' && navigator.onLine) {
+        // Prevent race conditions: do not background poll while user recently saved or added shows
+        if (Date.now() - lastUserActionTimestampRef.current < 7000) {
+          return;
+        }
+        if (syncGoogleSheetRef.current) {
+          syncGoogleSheetRef.current('auto_poll');
+        }
+      }
+    }, pollIntervalMs);
+
+    return () => clearInterval(interval);
+  }, [spreadsheetId]);
+
 
 
   const handleSignIn = async (): Promise<{ user: User; accessToken: string } | null> => {
@@ -1424,6 +1664,7 @@ export default function App() {
         ...(wishlistParsed.shows || []),
         ...(showcaseParsed.shows || [])
       ];
+      const dedupedCombined = deduplicateShowsByTitle(combinedShows);
       // Deduplicate & preserve sessionAddedAt and createdTimestamp from existing state & localStorage
       let sessionMap: Record<string, number> = {};
       try {
@@ -1431,7 +1672,7 @@ export default function App() {
       } catch {}
 
       const existingShowMap = new Map(shows.map((s) => [s.id, s]));
-      const finalShows = Array.from(new Map(combinedShows.map(s => [s.id, s])).values()).map((newShow) => {
+      const finalShows = dedupedCombined.map((newShow) => {
         const existing = existingShowMap.get(newShow.id);
         const normTitle = newShow.title ? newShow.title.trim().toLowerCase() : '';
         const savedSessionTime = sessionMap[newShow.id] || sessionMap[normTitle];
@@ -1549,23 +1790,130 @@ export default function App() {
     // No-op: Never auto-delete or clear release dates entered by the user
   }, []);
 
-  // Periodic 24-Hour Release Notification Check
+  // Periodic 24-Hour Release Notification Check & Live Rollover Tickers
+  const [now, setNow] = useState<number>(Date.now());
+  useEffect(() => {
+    const timer = setInterval(() => {
+      setNow(Date.now());
+    }, 10000); // Tick every 10 seconds to update all relative shelves/dates
+    return () => clearInterval(timer);
+  }, []);
+
+  // Central function to enrich series with live TVMaze schedules
+  const enrichSeriesSchedules = useCallback(async (currentShows: ShowItem[]) => {
+    if (!currentShows || currentShows.length === 0) return;
+
+    // Series that are Watching, Wishlist, or have release info
+    const seriesToFetch = currentShows.filter(
+      (s) =>
+        s.type === 'Series' &&
+        (s.status === '⏳ Watching' ||
+          s.isWishlist ||
+          Boolean(s.releaseDate || s.releaseNote || s.nextAirDate))
+    );
+
+    if (seriesToFetch.length === 0) return;
+
+    const TWENTY_FOUR_HOURS_MS = 24 * 60 * 60 * 1000;
+    const nowMs = Date.now();
+    let hasUpdates = false;
+    const updatedShows = [...showsRef.current];
+
+    for (const show of seriesToFetch) {
+      // Find show in our latest state to avoid overwrite of other properties
+      const latestIdx = updatedShows.findIndex((s) => s.id === show.id);
+      if (latestIdx === -1) continue;
+      const latestShow = updatedShows[latestIdx];
+
+      // Refresh if missing future schedule OR if previous schedule has passed more than 24 hours ago
+      const isNextEpisodeFuture = Boolean(latestShow.nextAirTimestamp && latestShow.nextAirTimestamp > nowMs);
+      const hasValidSchedule = isNextEpisodeFuture;
+
+      if (hasValidSchedule) {
+        continue;
+      }
+
+      try {
+        const info = await fetchLiveTvMazeInfo(latestShow.title);
+        if (info) {
+          const nextEp = info.nextEpisode;
+          const prevEp = info.outNowEpisode || info.previousEpisode;
+          const nextTs = getTvMazeEpisodeTimestamp(nextEp);
+          const prevTs = getTvMazeEpisodeTimestamp(prevEp);
+
+          // Re-verify index in case state shifted during network call
+          const currentIdx = updatedShows.findIndex((s) => s.id === show.id);
+          if (currentIdx !== -1) {
+            const cur = updatedShows[currentIdx];
+            if (
+              cur.nextAirDate !== nextEp?.airdate ||
+              cur.nextAirTime !== nextEp?.airtime ||
+              cur.nextAirTimestamp !== nextTs ||
+              cur.nextEpisodeTitle !== nextEp?.name ||
+              cur.nextSeasonNum !== nextEp?.season ||
+              cur.nextEpisodeNum !== nextEp?.number ||
+              cur.lastAirDate !== prevEp?.airdate ||
+              cur.lastAirTime !== prevEp?.airtime ||
+              cur.lastAirTimestamp !== prevTs ||
+              cur.lastEpisodeTitle !== prevEp?.name ||
+              cur.lastSeasonNum !== prevEp?.season ||
+              cur.lastEpisodeNum !== prevEp?.number
+            ) {
+              updatedShows[currentIdx] = {
+                ...cur,
+                nextAirDate: nextEp?.airdate || cur.nextAirDate,
+                nextAirTime: nextEp?.airtime || cur.nextAirTime,
+                nextAirTimestamp: nextTs || cur.nextAirTimestamp,
+                nextEpisodeTitle: nextEp?.name || cur.nextEpisodeTitle,
+                nextSeasonNum: nextEp?.season || cur.nextSeasonNum,
+                nextEpisodeNum: nextEp?.number || cur.nextEpisodeNum,
+                lastAirDate: prevEp?.airdate || cur.lastAirDate,
+                lastAirTime: prevEp?.airtime || cur.lastAirTime,
+                lastAirTimestamp: prevTs || cur.lastAirTimestamp,
+                lastEpisodeTitle: prevEp?.name || cur.lastEpisodeTitle,
+                lastSeasonNum: prevEp?.season || cur.lastSeasonNum,
+                lastEpisodeNum: prevEp?.number || cur.lastEpisodeNum,
+              };
+              hasUpdates = true;
+            }
+          }
+        }
+        // Avoid hammering TVMaze (200ms stagger)
+        await new Promise((resolve) => setTimeout(resolve, 200));
+      } catch (e) {
+        console.warn('Central schedule fetch failed for:', latestShow.title, e);
+      }
+    }
+
+    if (hasUpdates) {
+      setShows(updatedShows);
+    }
+  }, []);
+
+  // Background TVMaze schedule lookup on startup or shows count change
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      enrichSeriesSchedules(showsRef.current);
+    }, 1500);
+    return () => clearTimeout(timer);
+  }, [shows.length, enrichSeriesSchedules]);
+
+  // Periodic 24-Hour Release Notification & Rollover check (every 5 mins)
   useEffect(() => {
     if (!shows || shows.length === 0) return;
 
-    // Run checks immediately on mount or when shows are loaded/changed
     checkAndTrigger24hNotifications(shows);
 
-    // Re-check periodically every 5 minutes in case the tab stays open
     const interval = setInterval(() => {
       const current = showsRef.current;
       if (current && current.length > 0) {
         checkAndTrigger24hNotifications(current);
+        enrichSeriesSchedules(current);
       }
     }, 5 * 60 * 1000);
 
     return () => clearInterval(interval);
-  }, [shows]);
+  }, [shows.length, enrichSeriesSchedules]);
 
   // Quick increment episode with season advancement & auto-click Google Sheets sync
   const handleIncrementEpisode = useCallback(async (show: ShowItem) => {
@@ -1692,9 +2040,91 @@ export default function App() {
     }
   };
 
+  // Reset titles by name ("Tracker", "Lanterns")
+  const handleResetTitlesByName = useCallback((titlesToReset: string[]) => {
+    const now = Date.now();
+    setShows((prev) => {
+      let resetCount = 0;
+      const updated = prev.map((s) => {
+        const normTitle = (s.title || '').trim().toLowerCase();
+        const matches = titlesToReset.some((t) => normTitle.includes(t.trim().toLowerCase()));
+        if (matches) {
+          resetCount++;
+          const maxRank = prev.reduce((m, item) => {
+            const r = typeof item.addedRank === 'number' ? item.addedRank : (item.sortOrderNum || 0);
+            return r > m ? r : m;
+          }, 0);
+          const newRank = Math.max(maxRank + 1000, now * 10);
+
+          const resetShow: ShowItem = {
+            ...s,
+            seasons: s.type === 'Movie' ? '' : 'S1',
+            episodes: s.type === 'Movie' ? '' : 'E1',
+            status: s.isWishlist ? ('🎁 Wishlist' as any) : '⏳ Watching',
+            releaseDate: undefined,
+            releaseNote: undefined,
+            nextAirDate: undefined,
+            nextAirTimestamp: undefined,
+            addedTime: now,
+            sessionAddedAt: now,
+            createdTimestamp: now,
+            addedRank: newRank,
+            sortOrderNum: newRank,
+          };
+          if (spreadsheetId) {
+            syncShowToSheet(resetShow, true);
+          }
+          return resetShow;
+        }
+        return s;
+      });
+
+      if (resetCount > 0) {
+        showToast(`🔄 Reset progress & schedule for "${titlesToReset.join(', ')}"!`);
+        setAppDataCache({ shows: updated });
+      }
+      return updated;
+    });
+  }, [spreadsheetId, syncShowToSheet, showToast]);
+
+  // Execute title reset for "Tracker" and "Lanterns"
+  const resetTrackerAndLanternsDoneRef = useRef(false);
+  useEffect(() => {
+    if (resetTrackerAndLanternsDoneRef.current || !shows || shows.length === 0) return;
+    const targetKeywords = ['tracker', 'lanterns'];
+    const foundAny = shows.some((s) =>
+      targetKeywords.some((k) => (s.title || '').trim().toLowerCase().includes(k))
+    );
+
+    if (foundAny) {
+      resetTrackerAndLanternsDoneRef.current = true;
+      handleResetTitlesByName(['Tracker', 'Lanterns']);
+    }
+  }, [shows, handleResetTitlesByName]);
+
   // Save changes from Detail modal or Theater Column
   const handleSaveShow = (updatedShow: ShowItem) => {
-    setShows((prev) => prev.map((s) => (s.id === updatedShow.id ? updatedShow : s)));
+    const now = Date.now();
+    setShows((prev) => {
+      const existing = prev.find((s) => s.id === updatedShow.id);
+      let nextShow = updatedShow;
+      if (existing?.isWishlist && !updatedShow.isWishlist) {
+        const maxRank = prev.reduce((m, s) => {
+          const r = typeof s.addedRank === 'number' ? s.addedRank : (s.sortOrderNum || 0);
+          return r > m ? r : m;
+        }, 0);
+        const newRank = Math.max(maxRank + 1000, now * 10);
+        nextShow = {
+          ...updatedShow,
+          addedTime: now,
+          sessionAddedAt: now,
+          createdTimestamp: now,
+          addedRank: newRank,
+          sortOrderNum: newRank,
+        };
+      }
+      return prev.map((s) => (s.id === updatedShow.id ? nextShow : s));
+    });
     setSelectedShow(null);
     showToast(`Saved changes for "${updatedShow.title}"`);
 
@@ -1703,36 +2133,48 @@ export default function App() {
     }
   };
 
-  // Delete show
+  // Delete show - 100% INSTANT response
   const handleDeleteShow = (showToDelete: ShowItem) => {
     const targetTab = showToDelete.sheetTabName || (showToDelete.isWishlist ? wishlistSheetName : sheetName);
-    if (spreadsheetId) {
-      setConfirmState({
-        isOpen: true,
-        title: 'Delete from Google Sheet & Tracker?',
-        message: `Permanently delete "${showToDelete.title}" from your Google Sheet? This will remove the row from "${targetTab}".`,
-        confirmLabel: 'Delete from Google Sheet',
-        isDestructive: true,
-        onConfirm: async () => {
-          setConfirmState((prev) => ({ ...prev, isOpen: false }));
+    
+    const executeInstantDelete = () => {
+      lastUserActionTimestampRef.current = Date.now();
+      inFlightShowsRef.current.delete(showToDelete.id);
+      setConfirmState((prev) => ({ ...prev, isOpen: false }));
+
+      // 1. Instantly remove from local React state with 0ms delay!
+      deletedShowKeysRef.current.add(showToDelete.id);
+      try {
+        localStorage.setItem('showflix_deleted_tombstones', JSON.stringify(Array.from(deletedShowKeysRef.current).slice(-200)));
+      } catch {}
+
+      setShows((prev) => {
+        const next = prev.filter((s) => s.id !== showToDelete.id);
+        setAppDataCache({ shows: next });
+        return next;
+      });
+      if (selectedShow?.id === showToDelete.id) {
+        setSelectedShow(null);
+      }
+      showToast(`🗑️ Removed "${showToDelete.title}"`);
+
+      // 2. IMMEDIATELY broadcast to all other devices in real-time so they remove it instantly too!
+      broadcastDeleteShow(showToDelete);
+
+      // 3. Asynchronous background deletion from Google Sheet (or queue if offline)
+      if (!navigator.onLine) {
+        queueOfflineAction('DELETE_SHOW', {
+          id: showToDelete.id,
+          title: showToDelete.title,
+          rowNumber: showToDelete.rowNumber,
+          sheetTabName: targetTab,
+        });
+        return;
+      }
+
+      if (spreadsheetId) {
+        (async () => {
           let targetRow = showToDelete.rowNumber;
-
-          // Full Offline support: remove locally now, queue deletion to Google Sheet later
-          if (!navigator.onLine) {
-            queueOfflineAction('DELETE_SHOW', {
-              id: showToDelete.id,
-              title: showToDelete.title,
-              rowNumber: showToDelete.rowNumber,
-              sheetTabName: targetTab,
-            });
-            setShows((prev) => prev.filter((s) => s.id !== showToDelete.id));
-            if (selectedShow?.id === showToDelete.id) {
-              setSelectedShow(null);
-            }
-            showToast(`📴 Offline: Removed "${showToDelete.title}" locally — will delete from Sheet when online`);
-            return;
-          }
-
           try {
             let token = await getAccessToken();
             if (!token) {
@@ -1740,7 +2182,6 @@ export default function App() {
               token = authRes?.accessToken || null;
             }
             if (token) {
-              // If row number is missing or needs verification, find it by title in the sheet
               if (!targetRow) {
                 const foundRow = await findRowNumberByTitle(
                   spreadsheetId,
@@ -1759,46 +2200,24 @@ export default function App() {
                   targetTab === sheetName ? sheetTabId : undefined,
                   token
                 );
-                setAppDataCache({ shows: [] });
-                updateRemoteSync(); // Trigger remote sync
-                syncGoogleSheet('force'); // Trigger automatic reload
-                showToast(`Deleted "${showToDelete.title}" from "${targetTab}"`);
-              } else {
-                showToast(`Removed "${showToDelete.title}" from Tracker`);
+                updateRemoteSync({ action: 'DELETE_CONFIRM' });
               }
             }
           } catch (err: any) {
-            console.error('Sheet delete error:', err);
-            const msg = err?.message || String(err);
-            if (msg.includes('invalid authentication credentials') || msg.includes('401') || msg.includes('invalid_grant') || msg.includes('Expected OAuth 2 access token')) {
-              setCachedAccessToken(null);
-              showToast('⚠️ Google Sheets session expired. Opening Sheets Settings...');
-              handleOpenSettingsModal('sync');
-            } else {
-              showToast(`Removed locally. Sheet error: ${msg}`);
-            }
+            console.warn('Sheet delete background notice:', err);
           }
+        })();
+      }
+    };
 
-          // Update local state: remove show and decrement rowNumber of shows below it on same tab
-          setShows((prev) =>
-            prev
-              .filter((s) => s.id !== showToDelete.id)
-              .map((s) => {
-                if (
-                  targetRow &&
-                  s.rowNumber &&
-                  s.rowNumber > targetRow &&
-                  (s.sheetTabName || (s.isWishlist ? wishlistSheetName : sheetName)) === targetTab
-                ) {
-                  return { ...s, rowNumber: s.rowNumber - 1 };
-                }
-                return s;
-              })
-          );
-          if (selectedShow?.id === showToDelete.id) {
-            setSelectedShow(null);
-          }
-        },
+    if (spreadsheetId) {
+      setConfirmState({
+        isOpen: true,
+        title: 'Delete from Google Sheet & Tracker?',
+        message: `Permanently delete "${showToDelete.title}" from your Google Sheet? This will remove the row from "${targetTab}".`,
+        confirmLabel: 'Delete from Google Sheet',
+        isDestructive: true,
+        onConfirm: executeInstantDelete,
       });
     } else {
       setConfirmState({
@@ -1807,38 +2226,13 @@ export default function App() {
         message: `Are you sure you want to remove "${showToDelete.title}" from your watch list?`,
         confirmLabel: 'Delete Title',
         isDestructive: true,
-        onConfirm: () => {
-          setConfirmState((prev) => ({ ...prev, isOpen: false }));
-          setShows((prev) => prev.filter((s) => s.id !== showToDelete.id));
-          if (selectedShow?.id === showToDelete.id) {
-            setSelectedShow(null);
-          }
-          showToast(`Removed "${showToDelete.title}"`);
-        },
+        onConfirm: executeInstantDelete,
       });
     }
   };
 
   // Add new show with instant optimistic UI update
   const handleAddShow = (newShow: ShowItem) => {
-    // Strict Duplicate title prevention: auto-decline duplicates
-    const cleanCand = newShow.title.trim().toLowerCase().replace(/[^a-z0-9]/g, '');
-    const existingDupe = cleanCand.length >= 2 ? shows.find((s) => {
-      if (newShow.imdbId && s.imdbId && newShow.imdbId === s.imdbId) return true;
-      if (!s.title) return false;
-      const cleanExisting = s.title.trim().toLowerCase().replace(/[^a-z0-9]/g, '');
-      return cleanExisting.length >= 2 && cleanCand === cleanExisting;
-    }) : undefined;
-
-    if (existingDupe) {
-      showToast(
-        `🚫 Blocked Duplicate: "${newShow.title}" is already in your ${
-          existingDupe.isWishlist ? 'Wishlist' : 'Master Tracker'
-        } (${existingDupe.status})!`
-      );
-      return;
-    }
-
     const isWishlist = Boolean(newShow.isWishlist);
     const isMovie = newShow.type === 'Movie';
     const targetTab = newShow.sheetTabName || (isWishlist ? wishlistSheetName : sheetName);
@@ -1878,12 +2272,52 @@ export default function App() {
     }
 
     // 1. Instant optimistic UI update: Show appears on the dashboard immediately with 0ms delay!
+    const normTitle = normalizeTitleForComparison(sanitizedShow.title);
+    deletedShowKeysRef.current.delete(sanitizedShow.id);
+    if (normTitle) deletedShowKeysRef.current.delete(normTitle);
+
+    // Register in in-flight ref to prevent race conditions during background sync
+    inFlightShowsRef.current.set(sanitizedShow.id, { show: sanitizedShow, timestamp: now });
+    lastUserActionTimestampRef.current = now;
+
     if (sanitizedShow.releaseDate || sanitizedShow.releaseNote) {
       enableShowNotificationSilent(sanitizedShow.id);
     }
-    setShows((prev) => [sanitizedShow, ...prev]);
-    setAppDataCache({ shows: [] }); // Clear cache
-    syncGoogleSheet('force'); // Trigger automatic reload
+    setShows((prev) => [sanitizedShow, ...prev.filter((s) => s.id !== sanitizedShow.id)]);
+
+    // Centrally fetch and enrich with live TVMaze countdown/schedule info immediately in background
+    if (sanitizedShow.type === 'Series') {
+      fetchLiveTvMazeInfo(sanitizedShow.title).then((info) => {
+        if (info) {
+          const nextEp = info.nextEpisode;
+          const prevEp = info.outNowEpisode || info.previousEpisode;
+          const nextTs = getTvMazeEpisodeTimestamp(nextEp);
+          const prevTs = getTvMazeEpisodeTimestamp(prevEp);
+          setShows((prev) =>
+            prev.map((s) =>
+              s.id === sanitizedShow.id
+                ? {
+                    ...s,
+                    nextAirDate: nextEp?.airdate || s.nextAirDate,
+                    nextAirTime: nextEp?.airtime || s.nextAirTime,
+                    nextAirTimestamp: nextTs || s.nextAirTimestamp,
+                    nextEpisodeTitle: nextEp?.name || s.nextEpisodeTitle,
+                    nextSeasonNum: nextEp?.season || s.nextSeasonNum,
+                    nextEpisodeNum: nextEp?.number || s.nextEpisodeNum,
+                    lastAirDate: prevEp?.airdate || s.lastAirDate,
+                    lastAirTime: prevEp?.airtime || s.lastAirTime,
+                    lastAirTimestamp: prevTs || s.lastAirTimestamp,
+                    lastEpisodeTitle: prevEp?.name || s.lastEpisodeTitle,
+                    lastSeasonNum: prevEp?.season || s.lastSeasonNum,
+                    lastEpisodeNum: prevEp?.number || s.lastEpisodeNum,
+                  }
+                : s
+            )
+          );
+        }
+      }).catch(() => {});
+    }
+
     showToast(`✨ Added "${sanitizedShow.title}" to ${isWishlist ? 'Wishlist' : 'Master Tracker'}`);
 
     // 2. Asynchronous background sync to Google Sheets (or queue if offline)
@@ -1894,7 +2328,7 @@ export default function App() {
     }
 
     if (spreadsheetId) {
-      updateRemoteSync(); // Trigger remote sync
+      updateRemoteSync({ action: 'ADD', addedShow: sanitizedShow }); // Trigger real-time cross-device sync
       (async () => {
         let addedShow = { ...sanitizedShow };
         try {
@@ -1954,6 +2388,7 @@ export default function App() {
               setShows((prev) =>
                 prev.map((s) => (s.id === sanitizedShow.id ? { ...s, rowNumber: res.rowNumber, sheetTabName: addedShow.sheetTabName } : s))
               );
+              updateRemoteSync();
             }
           } else {
             queueOfflineAction('ADD_SHOW', sanitizedShow);
@@ -1974,103 +2409,89 @@ export default function App() {
   // Move show from Master Tracker to Wishlist
   const handleMoveToWishlist = async (showToMove: ShowItem) => {
     if (!showToMove || !showToMove.id) return;
+    const now = Date.now();
+    lastUserActionTimestampRef.current = now;
     if (movingShowIdsRef.current.has(showToMove.id)) {
       console.warn(`Already moving "${showToMove.title}", ignoring duplicate click.`);
       return;
     }
     movingShowIdsRef.current.add(showToMove.id);
 
-    if (!spreadsheetId) {
-      try {
-        setShows((prev) => {
-          const updated = prev.map((s) => (s.id === showToMove.id ? { ...s, isWishlist: true, sheetTabName: wishlistSheetName } : s));
-          const seen = new Set<string>();
-          return updated.filter((item) => {
-            const key = `${item.sheetTabName || (item.isWishlist ? 'wishlist' : 'master')}::${item.title.trim().toLowerCase()}`;
-            if (seen.has(key)) return false;
-            seen.add(key);
-            return true;
-          });
-        });
-        showToast(`Moved "${showToMove.title}" to Wishlist`);
-      } finally {
-        movingShowIdsRef.current.delete(showToMove.id);
-      }
-      return;
+    const targetTab = wishlistSheetName || 'Wishlist';
+    const normTitle = normalizeTitleForComparison(showToMove.title);
+
+    const maxRank = showsRef.current.reduce((m, s) => {
+      const r = typeof s.addedRank === 'number' ? s.addedRank : (s.sortOrderNum || 0);
+      return r > m ? r : m;
+    }, 0);
+    const newRank = Math.max(maxRank + 1000, now * 10);
+
+    const updatedShow: ShowItem = {
+      ...showToMove,
+      isWishlist: true,
+      sheetTabName: targetTab,
+      status: ('🎁 Wishlist' as any),
+      priority: normalizePriority(showToMove.priority),
+      addedTime: now,
+      sessionAddedAt: now,
+      createdTimestamp: now,
+      addedRank: newRank,
+      sortOrderNum: newRank,
+    };
+
+    if (normTitle) {
+      movedShowsRef.current.set(normTitle, { show: updatedShow, timestamp: now });
+    }
+    inFlightShowsRef.current.set(updatedShow.id, { show: updatedShow, timestamp: now });
+
+    // 1. INSTANT OPTIMISTIC UPDATE: Update React state immediately with zero lag!
+    setShows((prev) => {
+      const filtered = prev.filter((s) => {
+        const sNorm = normalizeTitleForComparison(s.title);
+        return s.id !== showToMove.id && (!sNorm || sNorm !== normTitle);
+      });
+      const next = [updatedShow, ...filtered];
+      setAppDataCache({ shows: next });
+      return next;
+    });
+
+    if (selectedShow?.id === showToMove.id) {
+      setSelectedShow(updatedShow);
     }
 
-    try {
-      let token = await getAccessToken();
-      if (!token) {
-        showToast('🔑 Authenticating Google session...');
-        const authRes = await handleSignIn();
-        token = authRes?.accessToken || null;
-      }
+    showToast(`🎁 Moved "${showToMove.title}" to Wishlist`);
 
-      if (!token) {
-        setShowSyncModal(true);
-        showToast('⚠️ Google sign-in required. Please click Connect to sign in.');
-        return;
-      }
-
-      setIsSyncing(true);
-      const res = await moveShowBetweenTabs(
-        spreadsheetId,
-        sheetName,
-        wishlistSheetName,
-        showToMove,
-        sheetHeaders,
-        token
-      );
-
-      const targetTab = res.targetSheetName || wishlistSheetName;
-      if (res.targetSheetName && res.targetSheetName !== wishlistSheetName) {
-        setWishlistSheetName(res.targetSheetName);
-        localStorage.setItem('bingebox_wishlist_sheet_name', res.targetSheetName);
-      }
-
-      setShows((prev) => {
-        const updated = prev.map((s) =>
-          s.id === showToMove.id
-            ? {
-                ...s,
-                ...showToMove,
-                isWishlist: true,
-                sheetTabName: targetTab,
-                rowNumber: res.newRowNumber,
-                priority: normalizePriority(showToMove.priority),
-                dateAdded: parseGoogleSheetsDate(showToMove.dateAdded || new Date()),
-              }
-            : s
-        );
-        const seen = new Set<string>();
-        return updated.filter((item) => {
-          const key = `${item.sheetTabName || (item.isWishlist ? 'wishlist' : 'master')}::${item.title.trim().toLowerCase()}`;
-          if (seen.has(key)) return false;
-          seen.add(key);
-          return true;
-        });
-      });
-      showToast(`🎁 Moved "${showToMove.title}" to "${targetTab}"`);
-    } catch (err: any) {
-      console.error('Failed to move show to wishlist:', err);
-      const msg = err?.message || String(err);
-      if (
-        msg.includes('invalid authentication credentials') ||
-        msg.includes('401') ||
-        msg.includes('403') ||
-        msg.includes('invalid_grant') ||
-        msg.includes('Expected OAuth 2 access token')
-      ) {
-        setCachedAccessToken(null);
-        showToast('⚠️ Google Sheets session expired. Opening Sheets Settings...');
-        handleOpenSettingsModal('sync');
-      } else {
-        showToast(`⚠️ Could not move to wishlist: ${msg}`);
-      }
-    } finally {
+    // 2. Background Google Sheets sync (non-blocking)
+    if (spreadsheetId) {
+      (async () => {
+        try {
+          let token = await getAccessToken();
+          if (!token) return;
+          setIsSyncing(true);
+          const res = await moveShowBetweenTabs(
+            spreadsheetId,
+            sheetName,
+            wishlistSheetName,
+            showToMove,
+            sheetHeaders,
+            token
+          );
+          const newTargetTab = res.targetSheetName || wishlistSheetName;
+          if (res.targetSheetName && res.targetSheetName !== wishlistSheetName) {
+            setWishlistSheetName(res.targetSheetName);
+            localStorage.setItem('bingebox_wishlist_sheet_name', res.targetSheetName);
+          }
+          // Force a fresh, absolute Google Sheet read immediately to show exactly what is on the sheet!
+          await syncGoogleSheet('force');
+        } catch (err: any) {
+          console.error('Background move to wishlist error:', err);
+        } finally {
+          setIsSyncing(false);
+          movingShowIdsRef.current.delete(showToMove.id);
+        }
+      })();
+    } else {
       movingShowIdsRef.current.delete(showToMove.id);
-      setIsSyncing(false);
     }
   };
 
@@ -2082,113 +2503,86 @@ export default function App() {
       return;
     }
     movingShowIdsRef.current.add(showToMove.id);
+    const now = Date.now();
+    lastUserActionTimestampRef.current = now;
 
-    if (!spreadsheetId) {
-      try {
-        setShows((prev) => {
-          const updated = prev.map((s) =>
-            s.id === showToMove.id
-              ? {
-                  ...s,
-                  ...showToMove,
-                  isWishlist: false,
-                  sheetTabName: sheetName,
-                  seasons: normalizeSeasonStr(showToMove.seasons || 'S1'),
-                  episodes: normalizeEpisodeStr(showToMove.episodes || 'E1'),
-                  maxEp: normalizeEpisodeStr(showToMove.maxEp || 'E8'),
-                  status: showToMove.status || '⏳ Watching',
-                }
-              : s
-          );
-          const seen = new Set<string>();
-          return updated.filter((item) => {
-            const key = `${item.sheetTabName || (item.isWishlist ? 'wishlist' : 'master')}::${item.title.trim().toLowerCase()}`;
-            if (seen.has(key)) return false;
-            seen.add(key);
-            return true;
-          });
-        });
-        showToast(`Moved "${showToMove.title}" to Master Tracker`);
-      } finally {
-        movingShowIdsRef.current.delete(showToMove.id);
-      }
-      return;
+    const targetTab = sheetName || 'Master Tracker';
+    const normTitle = normalizeTitleForComparison(showToMove.title);
+
+    const maxRank = showsRef.current.reduce((m, s) => {
+      const r = typeof s.addedRank === 'number' ? s.addedRank : (s.sortOrderNum || 0);
+      return r > m ? r : m;
+    }, 0);
+    const newRank = Math.max(maxRank + 1000, now * 10);
+
+    const updatedShow: ShowItem = {
+      ...showToMove,
+      isWishlist: false,
+      sheetTabName: targetTab,
+      seasons: normalizeSeasonStr(showToMove.seasons || 'S1'),
+      episodes: normalizeEpisodeStr(showToMove.episodes || 'E1'),
+      maxEp: normalizeEpisodeStr(showToMove.maxEp || 'E8'),
+      status: '⏳ Watching' as WatchStatus,
+      addedTime: now,
+      sessionAddedAt: now,
+      createdTimestamp: now,
+      addedRank: newRank,
+      sortOrderNum: newRank,
+    };
+
+    if (normTitle) {
+      movedShowsRef.current.set(normTitle, { show: updatedShow, timestamp: now });
+    }
+    inFlightShowsRef.current.set(updatedShow.id, { show: updatedShow, timestamp: now });
+
+    // 1. INSTANT OPTIMISTIC UPDATE: Update React state immediately with zero lag!
+    setShows((prev) => {
+      const filtered = prev.filter((s) => {
+        const sNorm = normalizeTitleForComparison(s.title);
+        return s.id !== showToMove.id && (!sNorm || sNorm !== normTitle);
+      });
+      const next = [updatedShow, ...filtered];
+      setAppDataCache({ shows: next });
+      return next;
+    });
+
+    if (selectedShow?.id === showToMove.id) {
+      setSelectedShow(updatedShow);
     }
 
-    try {
-      let token = await getAccessToken();
-      if (!token) {
-        showToast('🔑 Authenticating Google session...');
-        const authRes = await handleSignIn();
-        token = authRes?.accessToken || null;
-      }
+    showToast(`📊 Moved "${showToMove.title}" to Master Tracker`);
 
-      if (!token) {
-        setShowSyncModal(true);
-        showToast('⚠️ Google sign-in required. Please click Connect to sign in.');
-        return;
-      }
-
-      setIsSyncing(true);
-      const res = await moveShowBetweenTabs(
-        spreadsheetId,
-        wishlistSheetName,
-        sheetName,
-        showToMove,
-        sheetHeaders,
-        token
-      );
-
-      const targetTab = res.targetSheetName || sheetName;
-      if (res.targetSheetName && res.targetSheetName !== sheetName) {
-        setSheetName(res.targetSheetName);
-        localStorage.setItem('bingebox_sheet_name', res.targetSheetName);
-      }
-
-      setShows((prev) => {
-        const updated = prev.map((s) =>
-          s.id === showToMove.id
-            ? {
-                ...s,
-                ...showToMove,
-                isWishlist: false,
-                sheetTabName: targetTab,
-                rowNumber: res.newRowNumber,
-                seasons: normalizeSeasonStr(showToMove.seasons || 'S1'),
-                episodes: normalizeEpisodeStr(showToMove.episodes || 'E1'),
-                maxEp: normalizeEpisodeStr(showToMove.maxEp || 'E8'),
-                status: showToMove.status || '⏳ Watching',
-              }
-            : s
-        );
-        const seen = new Set<string>();
-        return updated.filter((item) => {
-          const key = `${item.sheetTabName || (item.isWishlist ? 'wishlist' : 'master')}::${item.title.trim().toLowerCase()}`;
-          if (seen.has(key)) return false;
-          seen.add(key);
-          return true;
-        });
-      });
-      showToast(`📊 Moved "${showToMove.title}" to "${targetTab}"`);
-    } catch (err: any) {
-      console.error('Failed to move show to master:', err);
-      const msg = err?.message || String(err);
-      if (
-        msg.includes('invalid authentication credentials') ||
-        msg.includes('401') ||
-        msg.includes('403') ||
-        msg.includes('invalid_grant') ||
-        msg.includes('Expected OAuth 2 access token')
-      ) {
-        setCachedAccessToken(null);
-        showToast('⚠️ Google Sheets session expired. Opening Sheets Settings...');
-        handleOpenSettingsModal('sync');
-      } else {
-        showToast(`⚠️ Could not move to master tracker: ${msg}`);
-      }
-    } finally {
+    // 2. Background Google Sheets sync (non-blocking)
+    if (spreadsheetId) {
+      (async () => {
+        try {
+          let token = await getAccessToken();
+          if (!token) return;
+          setIsSyncing(true);
+          const res = await moveShowBetweenTabs(
+            spreadsheetId,
+            wishlistSheetName,
+            sheetName,
+            showToMove,
+            sheetHeaders,
+            token
+          );
+          const newTargetTab = res.targetSheetName || sheetName;
+          if (res.targetSheetName && res.targetSheetName !== sheetName) {
+            setSheetName(res.targetSheetName);
+            localStorage.setItem('bingebox_sheet_name', res.targetSheetName);
+          }
+          // Force a fresh, absolute Google Sheet read immediately to show exactly what is on the sheet!
+          await syncGoogleSheet('force');
+        } catch (err: any) {
+          console.error('Background move to master error:', err);
+        } finally {
+          setIsSyncing(false);
+          movingShowIdsRef.current.delete(showToMove.id);
+        }
+      })();
+    } else {
       movingShowIdsRef.current.delete(showToMove.id);
-      setIsSyncing(false);
     }
   };
 
@@ -2240,30 +2634,33 @@ export default function App() {
       }
     }
 
-    // 2. Category / Status filter
-    if (activeFilter !== 'all') {
-      list = list.filter((show) => {
-        if (activeFilter === 'All Titles') return true;
-        if (activeFilter === '🎁 Wishlist' || activeFilter === 'Wishlist') return Boolean(show.isWishlist);
-        if (activeFilter === '🎯 High-Priority Wishlist' || activeFilter === '🎯 High Priority' || activeFilter === 'High Priority') {
-          return Boolean(show.isWishlist) && ((show.priority || '').toLowerCase().includes('high') || (show.priority || '').includes('🔴') || !show.priority);
-        }
-        if (activeFilter === 'Series') return show.type === 'Series';
-        if (activeFilter === 'Movie') return show.type === 'Movie';
-        if (activeFilter === '⏳ Watching') return show.status === '⏳ Watching';
-        if (activeFilter === '✅ Watched') return show.status === '✅ Watched';
-        if (activeFilter === '⭐ Top Rated' || activeFilter === 'Top Rated') {
-          const stars = show.ratingNum || (show.rating ? (show.rating.match(/⭐/g) || []).length : 0);
-          return stars >= 4 || (show.rating && (show.rating.toLowerCase().includes('excellent') || show.rating.toLowerCase().includes('great')));
-        }
-        if (activeFilter === '⏰ Coming Soon' || activeFilter === 'Coming Soon') {
-          return Boolean(show.releaseDate || show.releaseNote || show.nextAirDate || show.nextAirTimestamp);
-        }
-        if (activeFilter === '⏸️ Paused') return show.status === '⏸️ Paused';
-        if (activeFilter === '❌ Dropped') return show.status === '❌ Dropped';
-        if (activeFilter === '⏸️ Paused / ❌ Dropped') return show.status === '⏸️ Paused' || show.status === '❌ Dropped';
-        return true;
-      });
+    // 2. Category / Status filter (Wishlist items ONLY appear in Wishlist views)
+    if (activeFilter === '🎁 Wishlist' || activeFilter === 'Wishlist') {
+      list = list.filter((show) => isWishlistShow(show));
+    } else if (activeFilter === '🎯 High-Priority Wishlist' || activeFilter === '🎯 High Priority' || activeFilter === 'High Priority') {
+      list = list.filter((show) => isWishlistShow(show) && ((show.priority || '').toLowerCase().includes('high') || (show.priority || '').includes('🔴') || !show.priority));
+    } else {
+      // All Master views/filters strictly exclude Wishlist shows
+      list = list.filter((show) => !isWishlistShow(show));
+      if (activeFilter !== 'all' && activeFilter !== 'All Titles') {
+        list = list.filter((show) => {
+          if (activeFilter === 'Series') return show.type === 'Series';
+          if (activeFilter === 'Movie') return show.type === 'Movie';
+          if (activeFilter === '⏳ Watching') return show.status === '⏳ Watching';
+          if (activeFilter === '✅ Watched') return show.status === '✅ Watched';
+          if (activeFilter === '⭐ Top Rated' || activeFilter === 'Top Rated') {
+            const stars = show.ratingNum || (show.rating ? (show.rating.match(/⭐/g) || []).length : 0);
+            return stars >= 4 || (show.rating && (show.rating.toLowerCase().includes('excellent') || show.rating.toLowerCase().includes('great')));
+          }
+          if (activeFilter === '⏰ Coming Soon' || activeFilter === 'Coming Soon') {
+            return Boolean(show.releaseDate || show.releaseNote || show.nextAirDate || show.nextAirTimestamp);
+          }
+          if (activeFilter === '⏸️ Paused') return show.status === '⏸️ Paused';
+          if (activeFilter === '❌ Dropped') return show.status === '❌ Dropped';
+          if (activeFilter === '⏸️ Paused / ❌ Dropped') return show.status === '⏸️ Paused' || show.status === '❌ Dropped';
+          return true;
+        });
+      }
     }
 
     // 3. Year filter
@@ -2295,7 +2692,37 @@ export default function App() {
       });
     }
 
-    // 5. Sorting: Pure numeric sortOrder number DESCENDING for recently-added (highest = newest = top)
+    // 5. Sorting: Overridden for Coming Soon to always sort strictly by NEAREST date/time first!
+    if (activeFilter === '⏰ Coming Soon' || activeFilter === 'Coming Soon') {
+      return [...list].sort((a, b) => {
+        const effA = getEffectiveReleaseInfo(a);
+        const effB = getEffectiveReleaseInfo(b);
+        const outNowA = effA.isOut;
+        const outNowB = effB.isOut;
+
+        // 1. Active "OUT NOW" releases first
+        if (outNowA && !outNowB) return -1;
+        if (!outNowA && outNowB) return 1;
+
+        // If both are OUT NOW, sort by release time (latest release first)
+        if (outNowA && outNowB) {
+          const tsA = effA.timestamp || 0;
+          const tsB = effB.timestamp || 0;
+          return tsB - tsA;
+        }
+
+        // 2. Upcoming future releases: Sort strictly by NEAREST date/time FIRST (soonest at TOP → furthest at BOTTOM)
+        const tsA = effA.timestamp || 0;
+        const tsB = effB.timestamp || 0;
+
+        if (tsA && tsB) return tsA - tsB; // Soonest countdown (earliest future date/time) first!
+        if (tsA) return -1;
+        if (tsB) return 1;
+        return (a.releaseNote || a.title).localeCompare(b.releaseNote || b.title);
+      });
+    }
+
+    // Otherwise use standard sort order
     return [...list].sort((a, b) => {
       if (sortOrder === 'recently-added') {
         return compareRecentlyAdded(a, b);
@@ -2323,7 +2750,7 @@ export default function App() {
       }
       return compareRecentlyAdded(a, b);
     });
-  }, [baseFilteredList, selectedPlatform, sortOrder]);
+  }, [baseFilteredList, selectedPlatform, sortOrder, activeFilter]);
 
   // Pagination State for Filtered Results
   const [currentPage, setCurrentPage] = useState(1);
@@ -2428,14 +2855,160 @@ export default function App() {
       selectedYear !== 'all'
   );
 
-  // Featured billboard show
+  const activeDiagnosticList = useMemo(() => {
+    const logs: Record<string, any> = {};
+    const nowMs = Date.now();
+
+    const sheetMasterTitles = new Set(lastSyncSheetShowsRef.current.master.map((s) => normalizeTitleForComparison(s.title)).filter(Boolean));
+    const sheetWishlistTitles = new Set(lastSyncSheetShowsRef.current.wishlist.map((s) => normalizeTitleForComparison(s.title)).filter(Boolean));
+
+    const allKnownTitles = new Set([
+      ...shows.map((s) => s.title),
+      ...lastSyncSheetShowsRef.current.master.map((s) => s.title),
+      ...lastSyncSheetShowsRef.current.wishlist.map((s) => s.title)
+    ]);
+
+    allKnownTitles.forEach((title) => {
+      const norm = normalizeTitleForComparison(title);
+      if (!norm) return;
+
+      const s = shows.find((p) => normalizeTitleForComparison(p.title) === norm);
+      const onSheetMaster = sheetMasterTitles.has(norm);
+      const onSheetWishlist = sheetWishlistTitles.has(norm);
+
+      let filteredOut = !s;
+      let reason = s ? '✅ Passed all filters' : '❌ Discarded during sync (not in sheet or locked)';
+
+      if (s) {
+        // 1. Tombstone check
+        if (deletedShowKeysRef.current.has(s.id)) {
+          filteredOut = true;
+          reason = `❌ Deleted Tombstone ID matches: "${s.id}"`;
+        } else if (norm && deletedShowKeysRef.current.has(norm)) {
+          filteredOut = true;
+          reason = `❌ Legacy Tombstone Title match: "${norm}"`;
+        }
+        
+        // 2. Profile check
+        if (!filteredOut && activeProfile) {
+          const normActive = activeProfile.trim().toLowerCase();
+          if (s.who) {
+            const showWho = String(s.who).trim().toLowerCase();
+            const parts = showWho.split(/[&,\/]/).map((p) => p.trim());
+            if (showWho !== normActive && !showWho.includes(normActive) && !parts.includes(normActive)) {
+              filteredOut = true;
+              reason = `👤 Profile mismatch: show is for "${s.who}", active is "${activeProfile}"`;
+            }
+          } else {
+            filteredOut = true;
+            reason = `👤 Profile mismatch: show has no profile assigned, active is "${activeProfile}"`;
+          }
+        }
+
+        // 3. Search query check
+        if (!filteredOut && searchQuery.trim()) {
+          const query = searchQuery.trim().toLowerCase();
+          const t = (s.title || '').toLowerCase();
+          const g = (s.genre || '').toLowerCase();
+          const p = (s.platform || '').toLowerCase();
+          const n = (s.notes || '').toLowerCase();
+          const w = (s.who || '').toLowerCase();
+          const y = String(s.year || '').toLowerCase();
+          if (!t.includes(query) && !g.includes(query) && !p.includes(query) && !n.includes(query) && !w.includes(query) && !y.includes(query)) {
+            filteredOut = true;
+            reason = `🔍 Search query mismatch: does not match "${searchQuery}"`;
+          }
+        }
+
+        // 4. Category / Tab / Filter check
+        if (!filteredOut && activeFilter !== 'all' && activeFilter !== 'All Titles') {
+          if (activeFilter === '📋 Wishlist' || activeFilter === '📋  WISHLIST' || activeFilter === 'Wishlist') {
+            if (!s.isWishlist) {
+              filteredOut = true;
+              reason = `📂 Show is in Master tab, but active filter is Wishlist`;
+            }
+          } else if (activeFilter === '⏰ Coming Soon' || activeFilter === 'Coming Soon') {
+            if (!s.releaseDate && !s.releaseNote && !s.nextAirDate && !s.nextAirTimestamp) {
+              filteredOut = true;
+              reason = `⏰ Show has no premiere or countdown release date`;
+            }
+          } else if (activeFilter === '🎯 High-Priority Wishlist') {
+            const p = (s.priority || '').toLowerCase();
+            if (!s.isWishlist || (!p.includes('high') && !p.includes('🔴'))) {
+              filteredOut = true;
+              reason = `🎯 Show is not a high-priority Wishlist item`;
+            }
+          } else {
+            const statusMatch = s.status && String(s.status).toLowerCase().includes(activeFilter.toLowerCase().replace(/^[^\w\s]+/, '').trim());
+            if (!statusMatch) {
+              filteredOut = true;
+              reason = `🏷️ Status category mismatch: show is "${s.status}", active is "${activeFilter}"`;
+            }
+          }
+        }
+
+        // 5. Year check
+        if (!filteredOut && selectedYear !== 'all') {
+          if (s.year === undefined || s.year === null || String(s.year).trim() !== String(selectedYear).trim()) {
+            filteredOut = true;
+            reason = `📅 Year mismatch: show year is "${s.year}", active filter is "${selectedYear}"`;
+          }
+        }
+
+        // 6. Platform check
+        if (!filteredOut && selectedPlatform !== 'all') {
+          if (!s.platform) {
+            filteredOut = true;
+            reason = `📺 Platform mismatch: show has no platform, active filter is "${selectedPlatform}"`;
+          } else {
+            const normShow = normalizePlatform(s.platform);
+            const normSelected = normalizePlatform(selectedPlatform);
+            const match = normShow === normSelected || s.platform.trim() === selectedPlatform.trim() || s.platform.toLowerCase().includes(selectedPlatform.toLowerCase().replace(/^[^\w\s]+/, '').trim());
+            if (!match) {
+              filteredOut = true;
+              reason = `📺 Platform mismatch: show platform is "${s.platform}", active filter is "${selectedPlatform}"`;
+            }
+          }
+        }
+      } else {
+        // Why was it discarded?
+        if (deletedShowKeysRef.current.has(norm)) {
+          reason = `❌ Discarded: Matches deleted tombstone list`;
+        } else if (!onSheetMaster && !onSheetWishlist) {
+          reason = `❌ Discarded: Row does not exist on your Google Sheet Master or Wishlist tab`;
+        } else {
+          reason = `❌ Discarded: Resolved during sync or locked by local lockout`;
+        }
+      }
+
+      logs[norm] = {
+        title,
+        foundInMasterTab: onSheetMaster ? 'YES' : 'NO',
+        foundInWishlistTab: onSheetWishlist ? 'YES' : 'NO',
+        isWishlistFlag: s ? s.isWishlist : onSheetWishlist,
+        rowNumber: s ? s.rowNumber : undefined,
+        id: s ? s.id : 'none',
+        filteredOut,
+        reason,
+        timestamp: nowMs,
+      };
+    });
+
+    return Object.values(logs);
+  }, [shows, searchQuery, activeFilter, selectedPlatform, selectedYear, activeProfile]);
+
+  const masterFilteredShows = useMemo(() => {
+    return profileFilteredShows.filter((s) => s.isWishlist === false);
+  }, [profileFilteredShows]);
+
+  // Featured billboard show (Master only)
   const featuredShow = useMemo(() => {
-    const list = profileFilteredShows.length > 0 ? profileFilteredShows : shows;
+    const list = masterFilteredShows.length > 0 ? masterFilteredShows : shows.filter((s) => s.isWishlist === false);
     if (list.length === 0) return null;
     const watchingList = list.filter((s) => s.status === '⏳ Watching');
     const candidates = watchingList.length > 0 ? watchingList : list;
     return candidates[featuredIndex % candidates.length] || list[0];
-  }, [profileFilteredShows, shows, featuredIndex]);
+  }, [masterFilteredShows, shows, featuredIndex]);
 
   // Auto-slideshow for Hero Billboard
   useEffect(() => {
@@ -2446,74 +3019,74 @@ export default function App() {
     }, 12000); // 12 seconds per slide
 
     return () => clearInterval(timer);
-  }, [isAnyFilterActive, profileFilteredShows.length]);
+  }, [isAnyFilterActive, masterFilteredShows.length]);
 
-  // Show category collections
+  // Show category collections (Master only - Wishlist items NEVER appear here)
   const recentlyAddedShows = useMemo(() => {
-    if (!profileFilteredShows || profileFilteredShows.length === 0) return [];
-    const copy = [...profileFilteredShows];
+    if (!masterFilteredShows || masterFilteredShows.length === 0) return [];
+    const copy = [...masterFilteredShows];
     // Pure numeric sortOrder number DESCENDING (highest = newest = top)
     copy.sort(compareRecentlyAdded);
     return copy.slice(0, 20);
-  }, [profileFilteredShows]);
+  }, [masterFilteredShows]);
 
   const continueWatching = useMemo(
-    () => profileFilteredShows
+    () => masterFilteredShows
       .filter((s) => s.status === '⏳ Watching')
       .sort((a, b) => calculateShowProgress(b) - calculateShowProgress(a)),
-    [profileFilteredShows]
+    [masterFilteredShows]
   );
   const topRated = useMemo(
-    () => profileFilteredShows
+    () => masterFilteredShows
       .filter((s) => s.ratingNum >= 4 || s.rating.includes('5'))
-      .sort((a, b) => (b.ratingNum || 0) - (a.ratingNum || 0)),
-    [profileFilteredShows]
+      .sort((a, b) => (b.ratingNum || 0) - (a.ratingNum || 0) || compareByAddedRank(a, b)),
+    [masterFilteredShows]
   );
   const netflixShows = useMemo(
-    () => profileFilteredShows.filter((s) => s.platform.toLowerCase().includes('netflix')),
-    [profileFilteredShows]
+    () => masterFilteredShows.filter((s) => s.platform.toLowerCase().includes('netflix')).sort(compareByAddedRank),
+    [masterFilteredShows]
   );
   const primeShows = useMemo(
-    () => profileFilteredShows.filter((s) => s.platform.toLowerCase().includes('prime')),
-    [profileFilteredShows]
+    () => masterFilteredShows.filter((s) => s.platform.toLowerCase().includes('prime')).sort(compareByAddedRank),
+    [masterFilteredShows]
   );
   const disneyShows = useMemo(
-    () => profileFilteredShows.filter((s) => s.platform.toLowerCase().includes('disney')),
-    [profileFilteredShows]
+    () => masterFilteredShows.filter((s) => s.platform.toLowerCase().includes('disney')).sort(compareByAddedRank),
+    [masterFilteredShows]
   );
   const appleShows = useMemo(
-    () => profileFilteredShows.filter((s) => s.platform.toLowerCase().includes('apple')),
-    [profileFilteredShows]
+    () => masterFilteredShows.filter((s) => s.platform.toLowerCase().includes('apple')).sort(compareByAddedRank),
+    [masterFilteredShows]
   );
   const paramountShows = useMemo(
-    () => profileFilteredShows.filter((s) => s.platform.toLowerCase().includes('paramount')),
-    [profileFilteredShows]
+    () => masterFilteredShows.filter((s) => s.platform.toLowerCase().includes('paramount')).sort(compareByAddedRank),
+    [masterFilteredShows]
   );
   const maxShows = useMemo(
-    () => profileFilteredShows.filter((s) => s.platform.toLowerCase().includes('max') || s.platform.toLowerCase().includes('hbo')),
-    [profileFilteredShows]
+    () => masterFilteredShows.filter((s) => s.platform.toLowerCase().includes('max') || s.platform.toLowerCase().includes('hbo')).sort(compareByAddedRank),
+    [masterFilteredShows]
   );
   const skyShows = useMemo(
-    () => profileFilteredShows.filter((s) => s.platform.toLowerCase().includes('sky') || s.platform.toLowerCase().includes('now')),
-    [profileFilteredShows]
+    () => masterFilteredShows.filter((s) => s.platform.toLowerCase().includes('sky') || s.platform.toLowerCase().includes('now')).sort(compareByAddedRank),
+    [masterFilteredShows]
   );
   const watchedShows = useMemo(
-    () => profileFilteredShows.filter((s) => s.status === '✅ Watched'),
-    [profileFilteredShows]
+    () => masterFilteredShows.filter((s) => s.status === '✅ Watched').sort(compareByAddedRank),
+    [masterFilteredShows]
   );
   const pausedShows = useMemo(
-    () => profileFilteredShows.filter((s) => s.status === '⏸️ Paused' || s.status === '❌ Dropped'),
-    [profileFilteredShows]
+    () => masterFilteredShows.filter((s) => s.status === '⏸️ Paused' || s.status === '❌ Dropped').sort(compareByAddedRank),
+    [masterFilteredShows]
   );
   const wishlistShows = useMemo(
-    () => profileFilteredShows.filter((s) => s.isWishlist),
+    () => profileFilteredShows.filter((s) => s.isWishlist === true).sort(compareByAddedRank),
     [profileFilteredShows]
   );
   // High-Priority Wishlist Showcase: Highest priority shows from the Wishlist tab to watch next
   const highPriorityWishlistShows = useMemo(() => {
     if (!profileFilteredShows || profileFilteredShows.length === 0) return [];
 
-    const wishlist = profileFilteredShows.filter((s) => s.isWishlist);
+    const wishlist = profileFilteredShows.filter((s) => s.isWishlist === true);
     if (wishlist.length === 0) return [];
 
     // Filter for shows marked with High priority (or default high)
@@ -2522,66 +3095,40 @@ export default function App() {
       return p.includes('high') || p.includes('🔴');
     });
 
-    if (highShows.length > 0) {
-      // Sort High priority shows by rating (top rated first) or row order
-      return [...highShows].sort((a, b) => {
-        const ratingA = a.ratingNum || 0;
-        const ratingB = b.ratingNum || 0;
-        if (ratingA !== ratingB) return ratingB - ratingA;
-        return (a.rowNumber || 0) - (b.rowNumber || 0);
-      });
-    }
-
-    // Fallback: If none are explicitly marked High, order all wishlist shows by priority weight (High > Medium > Low)
-    const priorityWeight = (p?: string) => {
-      const lower = (p || '').toLowerCase();
-      if (lower.includes('high') || lower.includes('🔴')) return 3;
-      if (lower.includes('medium') || lower.includes('mid') || lower.includes('yellow') || lower.includes('🟡')) return 2;
-      if (lower.includes('low') || lower.includes('green') || lower.includes('🟢')) return 1;
-      return 2;
-    };
-
-    return [...wishlist].sort((a, b) => {
-      const diff = priorityWeight(b.priority) - priorityWeight(a.priority);
-      if (diff !== 0) return diff;
-      return (b.ratingNum || 0) - (a.ratingNum || 0);
-    });
+    const candidateList = highShows.length > 0 ? highShows : wishlist;
+    return [...candidateList].sort(compareByAddedRank);
   }, [profileFilteredShows]);
   const comingSoonShows = useMemo(() => {
-    const list = profileFilteredShows.filter((s) => Boolean(s.releaseDate || s.releaseNote || s.nextAirDate || s.nextAirTimestamp));
-    return [...list].sort((a, b) => {
-      const outNowA = isShowOutNow(a);
-      const outNowB = isShowOutNow(b);
+    const list = profileFilteredShows
+      .filter((s) => Boolean(s.releaseDate || s.releaseNote || s.nextAirDate || s.nextAirTimestamp))
+      .map((s) => ({ ...s, effectiveInfo: getEffectiveReleaseInfo(s) }))
+      .filter((s) => !s.effectiveInfo.isPastWindow || s.releaseNote);
 
-      // 1. "Out Now" titles first
+    return [...list].sort((a, b) => {
+      const outNowA = a.effectiveInfo.isOut;
+      const outNowB = b.effectiveInfo.isOut;
+
+      // 1. Active "OUT NOW" releases first
       if (outNowA && !outNowB) return -1;
       if (!outNowA && outNowB) return 1;
 
-      const tsA = a.releaseDate ? parseReleaseDateToTimestamp(a.releaseDate) : a.nextAirTimestamp || null;
-      const tsB = b.releaseDate ? parseReleaseDateToTimestamp(b.releaseDate) : b.nextAirTimestamp || null;
-
-      // 2. Future upcoming dates next
-      const now = Date.now();
-      const aIsFuture = tsA !== null && tsA > now;
-      const bIsFuture = tsB !== null && tsB > now;
-
-      if (aIsFuture && !bIsFuture) return -1;
-      if (!aIsFuture && bIsFuture) return 1;
-
-      // 3. Sort by closest date (earliest first for future, or latest first for past)
-      if (tsA !== null && tsB !== null) {
-        if (aIsFuture) {
-          return tsA - tsB; // Earliest future date first
-        } else {
-          return tsB - tsA; // Latest past date first
-        }
+      // If both are OUT NOW, sort by release time (latest release first)
+      if (outNowA && outNowB) {
+        const tsA = a.effectiveInfo.timestamp || 0;
+        const tsB = b.effectiveInfo.timestamp || 0;
+        return tsB - tsA;
       }
-      if (tsA !== null) return -1;
-      if (tsB !== null) return 1;
 
+      // 2. Upcoming future releases: Sort strictly by NEAREST date/time FIRST (soonest at TOP → furthest at BOTTOM)
+      const tsA = a.effectiveInfo.timestamp || 0;
+      const tsB = b.effectiveInfo.timestamp || 0;
+
+      if (tsA && tsB) return tsA - tsB; // Soonest countdown (earliest future date/time) first!
+      if (tsA) return -1;
+      if (tsB) return 1;
       return (a.releaseNote || a.title).localeCompare(b.releaseNote || b.title);
     });
-  }, [profileFilteredShows]);
+  }, [profileFilteredShows, now]);
 
   const renderMasterTrackerOverviewBar = (position: 'top' | 'bottom' = 'top') => (
     <div className={`max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 ${position === 'top' ? 'pt-2 sm:pt-3 pb-2' : 'pt-6 pb-4'}`}>
@@ -3631,10 +4178,24 @@ export default function App() {
             )}
 
             {/* Wishlist Sheet Shelf */}
-            {wishlistShows.length > 0 && (
+            {wishlistShows.length > 0 ? (
               <ShowRow
                 id="wishlist-shelf"
                 title="🎁 Your Wishlist"
+                titleInlineAction={
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setShowDecisionWheelModal(true);
+                    }}
+                    className="group bg-amber-500 hover:bg-amber-400 text-zinc-950 font-black text-xs px-2.5 py-1 rounded-lg transition-all cursor-pointer inline-flex items-center gap-1 shadow-md hover:scale-105 active:scale-95 shadow-amber-950/40 ml-1"
+                    title="Spin Wheel: Randomly pick a show from your Wishlist"
+                  >
+                    <span className="text-sm inline-block animate-[spin_6s_linear_infinite] group-hover:animate-[spin_1s_linear_infinite] group-hover:scale-110 transition-transform">🎡</span>
+                    <span>Spin Wheel</span>
+                  </button>
+                }
                 shows={wishlistShows.slice(0, 20)}
                 isLoading={isSyncing}
                 onOpenDetails={handleOpenDetails}
@@ -3644,18 +4205,20 @@ export default function App() {
                 onHoverEnter={handleHoverEnter}
                 onHoverLeave={handleHoverLeave}
                 viewerColors={viewerColors}
-                headerAction={
-                  <button
-                    type="button"
-                    onClick={() => setShowDecisionWheelModal(true)}
-                    className="bg-amber-500 hover:bg-amber-400 text-zinc-950 font-black text-xs px-3 py-1.5 rounded-lg transition-all cursor-pointer flex items-center gap-1.5 shadow-md hover:scale-105 active:scale-95"
-                    title="Spin Wheel: Randomly pick a show from your Wishlist"
-                  >
-                    <span className="text-sm">🎡</span>
-                    <span>Spin Wheel</span>
-                  </button>
-                }
               />
+            ) : (
+              <div className="bg-zinc-900/60 border border-zinc-800 rounded-2xl p-6 text-center my-4 shadow-xl">
+                <div className="text-3xl mb-2">🎁</div>
+                <h3 className="text-white font-bold text-base mb-1">No items in Wishlist</h3>
+                <p className="text-zinc-400 text-xs mb-4">Add shows to your Wishlist tab in Google Sheets starting at Row 4 to track them here!</p>
+                <button
+                  type="button"
+                  onClick={() => setShowAddModal(true)}
+                  className="bg-amber-500 hover:bg-amber-400 text-zinc-950 font-black text-xs px-4 py-2 rounded-lg transition-all cursor-pointer shadow-md hover:scale-105 active:scale-95"
+                >
+                  + Add to Wishlist
+                </button>
+              </div>
             )}
 
             {/* Coming Soon & Premieres Showcase Shelf */}
@@ -3937,6 +4500,8 @@ export default function App() {
         onUpdateCustomViewers={handleUpdateCustomViewers}
         viewerColors={viewerColors}
         onUpdateViewerColors={handleUpdateViewerColors}
+        viewerAvatars={viewerAvatars}
+        onUpdateViewerAvatars={handleUpdateViewerAvatars}
         alertIntervals={alertIntervals}
         onUpdateAlertIntervals={handleUpdateAlertIntervals}
         spreadsheetId={spreadsheetId}
@@ -4026,6 +4591,110 @@ export default function App() {
               <span>Contact Support</span>
             </button>
           </div>
+        </div>
+      </section>
+
+      {/* 📡 Live Diagnostics & Audit Console */}
+      <section className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 my-6">
+        <div className="bg-zinc-950 border border-zinc-800 rounded-2xl shadow-xl overflow-hidden">
+          <button
+            type="button"
+            onClick={() => setShowDiagnosticConsole(!showDiagnosticConsole)}
+            className="w-full flex items-center justify-between px-5 py-3.5 bg-zinc-900 hover:bg-zinc-850 transition-colors text-left focus:outline-none border-b border-zinc-850 cursor-pointer"
+          >
+            <div className="flex items-center gap-2">
+              <span className="text-sm">📡</span>
+              <div>
+                <strong className="text-white text-xs font-bold block">Live Sheet & Filter Diagnostics Console</strong>
+                <span className="text-[10px] text-zinc-500 font-normal">Real-time filter evaluation logs. Type any title to diagnose why it is displayed or hidden.</span>
+              </div>
+            </div>
+            <div className="flex items-center gap-2">
+              <span className="text-[10px] px-1.5 py-0.5 bg-zinc-800 rounded text-zinc-400 font-mono">
+                {activeDiagnosticList.length} titles evaluated
+              </span>
+              <span className="text-zinc-500 font-bold text-xs">{showDiagnosticConsole ? '▼ Collapse' : '▲ Expand'}</span>
+            </div>
+          </button>
+
+          {showDiagnosticConsole && (
+            <div className="p-5 space-y-4 max-h-[450px] overflow-y-auto">
+              <div className="flex items-center justify-between gap-3 flex-wrap">
+                <input
+                  type="text"
+                  placeholder="🔍 Type show title to diagnose... (e.g. Loki)"
+                  value={diagnosticQuery}
+                  onChange={(e) => setDiagnosticQuery(e.target.value)}
+                  className="bg-zinc-900 border border-zinc-750 rounded px-3 py-1.5 text-xs text-white placeholder-zinc-500 focus:outline-none focus:border-red-500 font-semibold w-full sm:max-w-xs"
+                />
+                <div className="flex items-center gap-2 text-[10px] text-zinc-400 font-mono">
+                  <span className="flex items-center gap-1"><span className="w-2.5 h-2.5 rounded-full bg-emerald-500"></span> Passed</span>
+                  <span className="flex items-center gap-1"><span className="w-2.5 h-2.5 rounded-full bg-red-500"></span> Filtered/Discarded</span>
+                </div>
+              </div>
+
+              <div className="space-y-2 font-sans">
+                {(() => {
+                  const filtered = activeDiagnosticList.filter((log) => {
+                    if (!diagnosticQuery.trim()) return true;
+                    return log.title.toLowerCase().includes(diagnosticQuery.trim().toLowerCase());
+                  });
+
+                  if (filtered.length === 0) {
+                    return (
+                      <p className="text-zinc-500 text-xs py-4 text-center">
+                        No titles match "{diagnosticQuery || 'your query'}" in current sync or memory.
+                      </p>
+                    );
+                  }
+
+                  return filtered.map((log) => (
+                    <div
+                      key={log.id + '-' + log.title}
+                      className={`p-3 rounded-lg border text-xs space-y-1.5 transition-all ${
+                        log.filteredOut
+                          ? 'bg-red-950/20 border-red-900/30 text-red-300'
+                          : 'bg-emerald-950/20 border-emerald-900/30 text-emerald-300'
+                      }`}
+                    >
+                      <div className="flex items-center justify-between gap-2 flex-wrap font-bold">
+                        <span className="text-white text-sm font-extrabold">{log.title}</span>
+                        <span className={`px-2 py-0.5 rounded text-[10px] uppercase font-bold ${
+                          log.filteredOut ? 'bg-red-500/10 text-red-400' : 'bg-emerald-500/10 text-emerald-400'
+                        }`}>
+                          {log.filteredOut ? '❌ Filtered Out / Discarded' : '✅ Active on Dashboard'}
+                        </span>
+                      </div>
+
+                      <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 text-[11px] text-zinc-300 font-sans">
+                        <div>
+                          <span className="text-zinc-500">Found in Master tab?</span>{' '}
+                          <strong className={log.foundInMasterTab === 'YES' ? 'text-emerald-400 font-bold' : 'text-zinc-500 font-bold'}>
+                            {log.foundInMasterTab}
+                          </strong>
+                        </div>
+                        <div>
+                          <span className="text-zinc-500">Found in Wishlist tab?</span>{' '}
+                          <strong className={log.foundInWishlistTab === 'YES' ? 'text-amber-400 font-bold' : 'text-zinc-500 font-bold'}>
+                            {log.foundInWishlistTab}
+                          </strong>
+                        </div>
+                        <div>
+                          <span className="text-zinc-500">isWishlist flag:</span>{' '}
+                          <strong className="text-zinc-400 font-mono">{String(log.isWishlistFlag)}</strong>
+                        </div>
+                      </div>
+
+                      <div className="text-[11px] bg-black/30 p-2 rounded border border-zinc-800/40 text-zinc-300 leading-relaxed font-mono">
+                        <span className="text-zinc-500 block text-[9px] uppercase font-mono tracking-wider mb-0.5">Evaluation Status Reason</span>
+                        {log.reason}
+                      </div>
+                    </div>
+                  ));
+                })()}
+              </div>
+            </div>
+          )}
         </div>
       </section>
 
@@ -4207,12 +4876,10 @@ export default function App() {
         />
       )}
 
-      {/* Instant ShowFlix Cinematic Splash Screen */}
       {showInitialLoadingScreen && (
         <InstantShowFlixLoadingScreen
-          message={isSyncing ? "Syncing ShowFlix Library..." : "Loading ShowFlix Library..."}
-          minDurationMs={1200}
           onFinish={() => setShowInitialLoadingScreen(false)}
+          minDurationMs={1200}
         />
       )}
     </div>

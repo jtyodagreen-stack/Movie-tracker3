@@ -30,8 +30,8 @@ import ImageUploader from './ImageUploader';
 import { normalizeSeasonStr, normalizeEpisodeStr, normalizePlatform, parseGoogleSheetsDate } from '../services/sheetsService';
 import { getOptimizedBackdrop } from '../utils/imageOptimizer';
 import { autoFetchPoster, getOrFetchImdbUrl } from '../services/posterService';
-import { extractDateOnly, extractTimeOnly, combineDateAndTime, formatToDDMMYYYY, formatToYYYYMMDD } from '../utils/dateUtils';
-import { isNotificationEnabled, toggleShowNotification, isShowOutNow, isFutureRelease, isReleaseDatePast, enableShowNotificationSilent } from '../services/notificationService';
+import { extractDateOnly, extractTimeOnly, combineDateAndTime, formatToDDMMYYYY, formatToYYYYMMDD, formatToLocalDisplay } from '../utils/dateUtils';
+import { isNotificationEnabled, toggleShowNotification, isShowOutNow, isFutureRelease, isReleaseDatePast, enableShowNotificationSilent, getEffectiveReleaseInfo } from '../services/notificationService';
 import { fetchLiveTvMazeInfo, TvMazeShowInfo, TvMazeEpisode } from '../services/tvMazeService';
 import { getPriorityIndicator } from '../utils/priorityUtils';
 import { useNotificationContext } from '../context/NotificationContext';
@@ -355,7 +355,7 @@ export default function ShowDetailModal({
           setTvMazeInfo(info);
           if (info && info.nextEpisode) {
             const nextEp = info.nextEpisode;
-            const fullReleaseDate = combineDateAndTime(nextEp.airdate, nextEp.airtime || '00:00');
+            const fullReleaseDate = nextEp.airstamp || combineDateAndTime(nextEp.airdate, nextEp.airtime || '00:00');
             const noteText = `S${nextEp.season} E${nextEp.number}: ${nextEp.name}`;
             
             setReleaseDateOnly((prev) => prev || nextEp.airdate);
@@ -553,6 +553,7 @@ export default function ShowDetailModal({
 
   const activeBackdrop = backdropUrl || posterUrl || show.backdropUrl || show.posterUrl || 'https://images.unsplash.com/photo-1574375927938-d5a98e8ffe85?q=80&w=1600&auto=format&fit=crop';
   const priorityIndicator = getPriorityIndicator(priority || show?.priority, show?.isWishlist);
+  const effectiveInfo = getEffectiveReleaseInfo(show, tvMazeInfo);
 
   return (
     <div
@@ -600,28 +601,40 @@ export default function ShowDetailModal({
           <div className="absolute inset-0 bg-gradient-to-t from-[#181818] via-[#181818]/40 to-transparent" />
           <div className="absolute inset-0 bg-gradient-to-r from-[#181818]/90 via-transparent to-transparent" />
 
-          {/* Action buttons top right */}
-          <div className="absolute top-3 left-3 sm:top-4 sm:left-4 z-20 flex items-center gap-2 flex-wrap">
+          {/* Action buttons top left */}
+          <div className="absolute top-3 left-3 sm:top-4 sm:left-4 z-20 flex items-center gap-1.5 flex-wrap">
             {show.isWishlist && (
-              <span className="text-[10px] sm:text-[11px] font-black px-2 sm:px-2.5 py-0.5 sm:py-1 rounded bg-amber-500 text-black border border-amber-400 shadow-xl flex items-center gap-1 sm:gap-1.5 transform -rotate-1">
-                <span>🎁</span>
-                <span>Wishlist</span>
+              <span className="text-[9px] font-extrabold px-1.5 py-0.5 rounded bg-amber-500/95 text-black border border-amber-400 shadow-md shrink-0">
+                🎁 Wishlist
               </span>
             )}
             {priorityIndicator && (
               <span
-                className={`text-[10px] sm:text-[11px] px-2 sm:px-2.5 py-0.5 sm:py-1 rounded border shadow-xl flex items-center gap-1 ${priorityIndicator.className}`}
+                className={`text-[9px] px-1.5 py-0.5 rounded border shadow-md shrink-0 flex items-center gap-0.5 ${priorityIndicator.className}`}
                 title={`Priority: ${priorityIndicator.tooltip}`}
               >
                 {priorityIndicator.label}
               </span>
             )}
-            {(show.releaseDate || show.releaseNote || releaseDate || releaseNote || tvMazeInfo?.nextEpisode) && (
-              <span className="text-[10px] sm:text-[11px] font-extrabold px-2 sm:px-2.5 py-0.5 sm:py-1 rounded bg-amber-400 text-black border border-amber-300 shadow-md shrink-0 flex items-center gap-1">
-                ⏰ {isReleaseDatePast(releaseDate || show.releaseDate) && tvMazeInfo?.nextEpisode
-                  ? `${formatToDDMMYYYY(tvMazeInfo.nextEpisode.airdate)} • S${tvMazeInfo.nextEpisode.season} E${tvMazeInfo.nextEpisode.number}`
-                  : formatToDDMMYYYY(releaseDate || show.releaseDate || (tvMazeInfo?.nextEpisode ? tvMazeInfo.nextEpisode.airdate : '')) || releaseNote || show.releaseNote || (tvMazeInfo?.nextEpisode ? `S${tvMazeInfo.nextEpisode.season} E${tvMazeInfo.nextEpisode.number}` : '')}
-              </span>
+            {(show.releaseDate || show.releaseNote || releaseDate || releaseNote || tvMazeInfo?.nextEpisode || tvMazeInfo?.previousEpisode || show.lastAirTimestamp) && (
+              effectiveInfo.isOut ? (
+                <span className="text-[9px] font-black uppercase tracking-wider px-2 py-0.5 rounded bg-emerald-500 text-black border border-emerald-400 shadow-md shrink-0 flex items-center gap-1 animate-pulse">
+                  🎉 OUT NOW!
+                </span>
+              ) : (effectiveInfo.isPastWindow && !effectiveInfo.isNextEpisode) ? null : (
+                <span
+                  className="text-[9px] font-extrabold px-1.5 py-0.5 rounded bg-amber-400 text-black border border-amber-300 shadow-md shrink-0 flex items-center gap-0.5"
+                  title={
+                    effectiveInfo.isNextEpisode && tvMazeInfo?.nextEpisode
+                      ? `Next Episode: S${tvMazeInfo.nextEpisode.season} E${tvMazeInfo.nextEpisode.number} - ${tvMazeInfo.nextEpisode.name} (${formatToDDMMYYYY(tvMazeInfo.nextEpisode.airdate)})`
+                      : (releaseDate || show.releaseDate)
+                      ? `Release Date: ${formatToDDMMYYYY(releaseDate || show.releaseDate)}`
+                      : ''
+                  }
+                >
+                  ⏰ {effectiveInfo.label || effectiveInfo.formattedDateStr || ''}
+                </span>
+              )
             )}
           </div>
 
@@ -758,59 +771,77 @@ export default function ShowDetailModal({
           </div>
 
           {/* Release Premiere Info Bar (Identical to Netflix Hover Portal) */}
-          {show && (show.releaseDate || show.releaseNote || releaseDate || releaseNote || tvMazeInfo?.nextEpisode) && (
-            isShowOutNow(show) ? (
-              <div className="flex items-center justify-between gap-3 px-3.5 py-2.5 rounded-lg bg-emerald-500/15 border border-emerald-500/40 text-emerald-300 text-xs font-bold shadow">
-                <div className="flex items-center gap-2">
-                  <span className="text-base animate-bounce">🎉</span>
-                  <span className="font-black text-emerald-200">OUT NOW!</span>
-                  <span>— Available to stream on {show.platform || 'TV'}</span>
-                </div>
-                <span className="text-[10px] font-mono uppercase bg-emerald-500/20 px-2 py-0.5 rounded text-emerald-300 border border-emerald-500/30">
-                  RELEASED
-                </span>
-              </div>
-            ) : isFutureRelease(show) || (!show.releaseDate && (show.releaseNote || releaseNote || tvMazeInfo?.nextEpisode)) || Boolean(tvMazeInfo?.nextEpisode) ? (
-              <div className="flex items-center justify-between gap-3 px-3.5 py-2.5 rounded-lg bg-amber-500/10 border border-amber-500/30 text-amber-300 text-xs font-bold flex-wrap">
-                <div className="flex items-center gap-2">
-                  <span className="text-sm">⏰</span>
-                  <span>
-                    {isReleaseDatePast(releaseDate || show.releaseDate) && tvMazeInfo?.nextEpisode
-                      ? `Next Episode Premiere: ${formatToDDMMYYYY(tvMazeInfo.nextEpisode.airdate)}${tvMazeInfo.nextEpisode.airtime ? ` at ${tvMazeInfo.nextEpisode.airtime}` : ''}`
-                      : releaseDate || show.releaseDate || tvMazeInfo?.nextEpisode
-                      ? `Target Premiere: ${formatToDDMMYYYY(releaseDate || show.releaseDate || (tvMazeInfo?.nextEpisode ? tvMazeInfo.nextEpisode.airdate : ''))}`
-                      : 'Upcoming Release'}
-                    {isReleaseDatePast(releaseDate || show.releaseDate) && tvMazeInfo?.nextEpisode
-                      ? ` (S${tvMazeInfo.nextEpisode.season} E${tvMazeInfo.nextEpisode.number}: ${tvMazeInfo.nextEpisode.name})`
-                      : releaseNote || show.releaseNote || tvMazeInfo?.nextEpisode
-                      ? ` (${releaseNote || show.releaseNote || (tvMazeInfo?.nextEpisode ? `S${tvMazeInfo.nextEpisode.season} E${tvMazeInfo.nextEpisode.number}: ${tvMazeInfo.nextEpisode.name}` : '')})`
-                      : ''}
-                  </span>
-                </div>
+          {show && (show.releaseDate || show.releaseNote || releaseDate || releaseNote || tvMazeInfo?.nextEpisode || tvMazeInfo?.previousEpisode || show.lastAirTimestamp) && (
+            (() => {
+              const eff = getEffectiveReleaseInfo(show, tvMazeInfo);
+              if (eff.isOut) {
+                return (
+                  <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 px-3.5 py-2.5 rounded-lg bg-emerald-500/15 border border-emerald-500/40 text-emerald-300 text-xs font-bold shadow">
+                    <div className="flex items-center gap-2">
+                      <span className="text-base animate-bounce">🎉</span>
+                      <span className="font-black text-emerald-200">OUT NOW!</span>
+                      <span>
+                        {eff.outNowEpisode?.season && eff.outNowEpisode?.number
+                          ? `S${eff.outNowEpisode.season} E${eff.outNowEpisode.number}${eff.outNowEpisode.name ? ` • "${eff.outNowEpisode.name}"` : ''}`
+                          : ''}
+                        {' — Available to stream on '}{show.platform || 'TV'}
+                      </span>
+                    </div>
+                    {eff.upcomingEpisode && (
+                      <span className="text-[11px] font-mono font-bold bg-amber-500/20 text-amber-300 border border-amber-500/30 px-2 py-0.5 rounded self-start sm:self-auto">
+                        Next: S{eff.upcomingEpisode.season} E{eff.upcomingEpisode.number} ({formatToDDMMYYYY(eff.upcomingEpisode.airdate)})
+                      </span>
+                    )}
+                  </div>
+                );
+              }
 
-                <button
-                  type="button"
-                  onClick={handleToggleNotif}
-                  className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-md text-xs font-bold transition-all cursor-pointer border ${
-                    isNotifActive
-                      ? 'bg-amber-400 text-black border-amber-300 shadow'
-                      : 'bg-zinc-800 text-zinc-300 border-zinc-700 hover:text-white hover:bg-zinc-700'
-                  }`}
-                >
-                  {isNotifActive ? (
-                    <>
-                      <BellRing className="w-3.5 h-3.5 text-black animate-pulse" />
-                      <span>24h Alert On</span>
-                    </>
-                  ) : (
-                    <>
-                      <Bell className="w-3.5 h-3.5" />
-                      <span>Notify Me 24h Before</span>
-                    </>
-                  )}
-                </button>
-              </div>
-            ) : null
+              if (eff.isFuture || isFutureRelease(show) || (!show.releaseDate && (show.releaseNote || releaseNote || tvMazeInfo?.nextEpisode)) || Boolean(tvMazeInfo?.nextEpisode)) {
+                return (
+                  <div className="flex items-center justify-between gap-3 px-3.5 py-2.5 rounded-lg bg-amber-500/10 border border-amber-500/30 text-amber-300 text-xs font-bold flex-wrap">
+                    <div className="flex items-center gap-2">
+                      <span className="text-sm">⏰</span>
+                      <span>
+                        {isReleaseDatePast(releaseDate || show.releaseDate) && tvMazeInfo?.nextEpisode
+                          ? `Next Episode Premiere: ${formatToDDMMYYYY(tvMazeInfo.nextEpisode.airdate)}${tvMazeInfo.nextEpisode.airtime ? ` at ${tvMazeInfo.nextEpisode.airtime}` : ''}`
+                          : releaseDate || show.releaseDate || tvMazeInfo?.nextEpisode
+                          ? `Target Premiere: ${formatToDDMMYYYY(releaseDate || show.releaseDate || (tvMazeInfo?.nextEpisode ? tvMazeInfo.nextEpisode.airdate : ''))}`
+                          : 'Upcoming Release'}
+                        {isReleaseDatePast(releaseDate || show.releaseDate) && tvMazeInfo?.nextEpisode
+                          ? ` (S${tvMazeInfo.nextEpisode.season} E${tvMazeInfo.nextEpisode.number}: ${tvMazeInfo.nextEpisode.name})`
+                          : releaseNote || show.releaseNote || tvMazeInfo?.nextEpisode
+                          ? ` (${releaseNote || show.releaseNote || (tvMazeInfo?.nextEpisode ? `S${tvMazeInfo.nextEpisode.season} E${tvMazeInfo.nextEpisode.number}: ${tvMazeInfo.nextEpisode.name}` : '')})`
+                          : ''}
+                      </span>
+                    </div>
+
+                    <button
+                      type="button"
+                      onClick={handleToggleNotif}
+                      className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-md text-xs font-bold transition-all cursor-pointer border ${
+                        isNotifActive
+                          ? 'bg-amber-400 text-black border-amber-300 shadow'
+                          : 'bg-zinc-800 text-zinc-300 border-zinc-700 hover:text-white hover:bg-zinc-700'
+                      }`}
+                    >
+                      {isNotifActive ? (
+                        <>
+                          <BellRing className="w-3.5 h-3.5 text-black animate-pulse" />
+                          <span>24h Alert On</span>
+                        </>
+                      ) : (
+                        <>
+                          <Bell className="w-3.5 h-3.5" />
+                          <span>Notify Me 24h Before</span>
+                        </>
+                      )}
+                    </button>
+                  </div>
+                );
+              }
+
+              return null;
+            })()
           )}
 
           {/* Progress & Watch Status Card */}
@@ -1371,6 +1402,26 @@ export default function ShowDetailModal({
                     </div>
                   ) : tvMazeInfo ? (
                     <div className="space-y-3.5">
+                      {/* Active OUT NOW Episode (within 24 hours from exact airstamp) */}
+                      {tvMazeInfo.outNowEpisode && (
+                        <div className="p-3 bg-emerald-950/30 border border-emerald-500/40 rounded-lg space-y-2 shadow-md">
+                          <div className="flex items-center justify-between gap-2 flex-wrap">
+                            <span className="text-[10px] uppercase tracking-wider font-black px-2 py-0.5 rounded bg-emerald-500 text-black shadow-sm animate-pulse">
+                              🎉 S{tvMazeInfo.outNowEpisode.season} E{tvMazeInfo.outNowEpisode.number} OUT NOW!
+                            </span>
+                            <span className="text-[11px] font-mono text-emerald-300 font-bold">
+                              Aired {tvMazeInfo.outNowEpisode.airstamp ? formatToLocalDisplay(tvMazeInfo.outNowEpisode.airstamp) : `${tvMazeInfo.outNowEpisode.airdate} at ${tvMazeInfo.outNowEpisode.airtime || '20:00'}`}
+                            </span>
+                          </div>
+                          <h5 className="text-xs font-black text-white">
+                            &ldquo;{tvMazeInfo.outNowEpisode.name}&rdquo;
+                          </h5>
+                          <p className="text-[11px] text-emerald-300/90 font-medium">
+                            Available now to stream on {show.platform || 'TV'} (Active in 24h release window)
+                          </p>
+                        </div>
+                      )}
+
                       {tvMazeInfo.nextEpisode ? (
                         <div className="p-3 bg-indigo-950/20 border border-indigo-900/40 rounded-lg space-y-2.5">
                           <div className="flex items-start justify-between gap-3 flex-wrap">

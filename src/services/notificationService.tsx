@@ -1,6 +1,8 @@
 import React from 'react';
 import toast from 'react-hot-toast';
 import { ShowItem, AlertIntervals } from '../types';
+import { formatToLocalDisplay } from '../utils/dateUtils';
+import { TvMazeEpisode, TvMazeShowInfo, getTvMazeEpisodeTimestamp } from './tvMazeService';
 
 const NOTIF_KEY = 'showtracker_24h_notifications';
 const NOTIFIED_KEY = 'showtracker_sent_notifications';
@@ -435,22 +437,6 @@ export function parseReleaseDateToTimestamp(dateStr?: string): number | null {
 }
 
 /**
- * Checks if a show's release date/time has passed and it is currently within 24 hours of release ("Out Now").
- * After 24 hours have passed since release, this returns false so the card returns back to normal display.
- */
-export function isShowOutNow(show: ShowItem): boolean {
-  if (!show.releaseDate) return false;
-  const targetTime = parseReleaseDateToTimestamp(show.releaseDate);
-  if (!targetTime) return false;
-
-  const now = Date.now();
-  const TWENTY_FOUR_HOURS_MS = 24 * 60 * 60 * 1000;
-
-  const elapsed = now - targetTime;
-  return elapsed >= 0 && elapsed <= TWENTY_FOUR_HOURS_MS;
-}
-
-/**
  * Checks if a show has a future release date that has not yet arrived.
  */
 export function isFutureRelease(show: ShowItem): boolean {
@@ -492,16 +478,17 @@ export function checkAndTrigger24hNotifications(shows: ShowItem[]): number {
 
   shows.forEach((show) => {
     if (!enabledIds.includes(show.id)) return;
-    if (!show.releaseDate) return;
 
-    const targetTime = parseReleaseDateToTimestamp(show.releaseDate);
+    // Use getEffectiveReleaseInfo to get correct timing (live network schedule priority)
+    const eff = getEffectiveReleaseInfo(show);
+    const targetTime = eff.timestamp;
     if (!targetTime) return;
 
     const timeDiff = targetTime - now;
 
     // Helper to send alert once
     const trySend = (keySuffix: string, label: string) => {
-      const key = `${show.id}_${show.releaseDate}_${keySuffix}`;
+      const key = `${show.id}_${targetTime}_${keySuffix}`;
       if (!sentKeys.includes(key)) {
         sendIntervalNotificationAlert(show, label);
         markNotifiedSent(key);
@@ -530,8 +517,8 @@ export function checkAndTrigger24hNotifications(shows: ShowItem[]): number {
     }
 
     // 5. "OUT NOW!" Release Alert (countdown reached 0 / release date reached, valid for 48h past)
-    if (intervals.atRelease && timeDiff <= 0 && timeDiff >= -48 * ONE_HOUR_MS) {
-      const outNowKey = `${show.id}_${show.releaseDate}_out_now`;
+    if (intervals.atRelease && eff.isOut) {
+      const outNowKey = `${show.id}_${targetTime}_out_now`;
       if (!sentKeys.includes(outNowKey)) {
         sendOutNowNotificationAlert(show);
         markNotifiedSent(outNowKey);
@@ -543,18 +530,272 @@ export function checkAndTrigger24hNotifications(shows: ShowItem[]): number {
   return sentCount;
 }
 
-export function getEffectiveReleaseInfo(show: ShowItem): { timestamp: number | null; formattedDateStr: string; date: Date | null; label: string; isOut: boolean } {
-  const raw = show.releaseDate || show.releaseNote || show.nextAirDate || '';
-  const timestamp = parseReleaseDateToTimestamp(raw);
-  const now = Date.now();
-  const isOut = timestamp ? timestamp <= now : false;
-  return {
-    timestamp,
-    formattedDateStr: raw,
-    date: timestamp ? new Date(timestamp) : null,
-    label: raw || 'Coming Soon',
-    isOut,
+function hasExplicitTime(str?: string): boolean {
+  if (!str) return false;
+  return /([01]?\d|2[0-3]):[0-5]\d|\b\d{1,2}\s*(am|pm)\b/i.test(str);
+}
+
+export interface EffectiveReleaseInfo {
+  timestamp: number | null;
+  outNowTimestamp?: number | null;
+  nextEpisodeTimestamp?: number | null;
+  formattedDateStr: string;
+  date: Date | null;
+  label: string;
+  isOut: boolean;
+  isPastWindow: boolean;
+  isFuture: boolean;
+  isNextEpisode: boolean;
+  outNowEpisode?: {
+    season?: number | string;
+    number?: number | string;
+    name?: string;
+    airstamp?: string;
+    timestamp?: number;
+    airdate?: string;
+    airtime?: string;
   };
+  upcomingEpisode?: {
+    season?: number | string;
+    number?: number | string;
+    name?: string;
+    airstamp?: string;
+    timestamp?: number;
+    airdate?: string;
+    airtime?: string;
+  };
+}
+
+export function getEffectiveReleaseInfo(
+  show: ShowItem,
+  liveAirstampOrTvMaze?: string | TvMazeShowInfo | null
+): EffectiveReleaseInfo {
+  if (!show) {
+    return {
+      timestamp: null,
+      formattedDateStr: '',
+      date: null,
+      label: 'Coming Soon',
+      isOut: false,
+      isPastWindow: false,
+      isFuture: false,
+      isNextEpisode: false,
+    };
+  }
+
+  const now = Date.now();
+  const TWENTY_FOUR_HOURS_MS = 24 * 60 * 60 * 1000;
+
+  // 1. Identify previous/recent episode (for exact 24h OUT NOW window)
+  let prevTs: number | null = null;
+  let prevEpObj: any = null;
+
+  if (typeof liveAirstampOrTvMaze === 'object' && liveAirstampOrTvMaze) {
+    const candidate = liveAirstampOrTvMaze.outNowEpisode || liveAirstampOrTvMaze.previousEpisode;
+    if (candidate) {
+      prevEpObj = candidate;
+      prevTs = getTvMazeEpisodeTimestamp(candidate);
+    }
+  }
+
+  if (prevTs === null && show.lastAirTimestamp) {
+    prevTs = show.lastAirTimestamp;
+  }
+  if (prevTs === null && show.lastAirDate) {
+    prevTs = parseReleaseDateToTimestamp(show.lastAirDate);
+  }
+
+  // 2. Identify next/upcoming episode timestamp
+  let nextTs: number | null = null;
+  let nextEpObj: any = null;
+
+  if (typeof liveAirstampOrTvMaze === 'string' && liveAirstampOrTvMaze) {
+    const parsed = new Date(liveAirstampOrTvMaze).getTime();
+    if (!isNaN(parsed)) nextTs = parsed;
+  } else if (typeof liveAirstampOrTvMaze === 'object' && liveAirstampOrTvMaze?.nextEpisode) {
+    nextEpObj = liveAirstampOrTvMaze.nextEpisode;
+    nextTs = getTvMazeEpisodeTimestamp(nextEpObj);
+  }
+
+  if (nextTs === null && show.nextAirTimestamp) {
+    nextTs = show.nextAirTimestamp;
+  }
+  if (nextTs === null && show.nextAirDate) {
+    nextTs = parseReleaseDateToTimestamp(show.nextAirDate);
+  }
+
+  // If nextEp has already passed its exact airstamp and is within the 24h window, it is the OUT NOW episode
+  if (nextTs !== null && now >= nextTs && now < nextTs + TWENTY_FOUR_HOURS_MS) {
+    if (prevTs === null || nextTs >= prevTs) {
+      prevTs = nextTs;
+      prevEpObj = nextEpObj;
+      nextTs = null;
+      nextEpObj = null;
+    }
+  }
+
+  // 3. User-entered primary release date (e.g. for movies or manually tracked shows)
+  let primaryTs = parseReleaseDateToTimestamp(show.releaseDate);
+  if (primaryTs !== null && !hasExplicitTime(show.releaseDate)) {
+    const dateObj = new Date(primaryTs);
+    const today = new Date();
+    if (
+      dateObj.getFullYear() === today.getFullYear() &&
+      dateObj.getMonth() === today.getMonth() &&
+      dateObj.getDate() === today.getDate()
+    ) {
+      const primeTimeDate = new Date(dateObj.getFullYear(), dateObj.getMonth(), dateObj.getDate(), 20, 0, 0);
+      if (primeTimeDate.getTime() > now) {
+        primaryTs = primeTimeDate.getTime();
+      }
+    }
+  }
+
+  const isSeries = show.type === 'Series';
+
+  // Construct structured episode descriptors
+  const outNowFromPrev = prevTs !== null ? {
+    season: prevEpObj?.season || show.lastSeasonNum,
+    number: prevEpObj?.number || show.lastEpisodeNum,
+    name: prevEpObj?.name || show.lastEpisodeTitle,
+    airstamp: prevEpObj?.airstamp,
+    timestamp: prevTs,
+    airdate: prevEpObj?.airdate || show.lastAirDate,
+    airtime: prevEpObj?.airtime || show.lastAirTime,
+  } : undefined;
+
+  const upcomingFromNext = nextTs !== null && nextTs > now ? {
+    season: nextEpObj?.season || show.nextSeasonNum,
+    number: nextEpObj?.number || show.nextEpisodeNum,
+    name: nextEpObj?.name || show.nextEpisodeTitle,
+    airstamp: nextEpObj?.airstamp,
+    timestamp: nextTs,
+    airdate: nextEpObj?.airdate || show.nextAirDate,
+    airtime: nextEpObj?.airtime || show.nextAirTime,
+  } : undefined;
+
+  // RULE A: 24-HOUR EXACT OUT NOW WINDOW
+  // 1. Check if episode aired within the last 24 hours:
+  // Starts at EXACT airstamp (now >= prevTs) and STAYS visible for FULL 24 hours (now < prevTs + TWENTY_FOUR_HOURS_MS)
+  // Do NOT roll to next episode until the 24 hours are COMPLETELY finished!
+  if (isSeries && prevTs !== null && now >= prevTs && now < prevTs + TWENTY_FOUR_HOURS_MS) {
+    const hasUpcoming = Boolean(upcomingFromNext?.timestamp && upcomingFromNext.timestamp > now);
+    const labelStr = outNowFromPrev?.season && outNowFromPrev?.number
+      ? `S${outNowFromPrev.season} E${outNowFromPrev.number}${outNowFromPrev.name ? ` • ${outNowFromPrev.name}` : ''}`
+      : formatToLocalDisplay(prevTs);
+
+    return {
+      timestamp: hasUpcoming ? (upcomingFromNext!.timestamp || prevTs) : prevTs,
+      outNowTimestamp: prevTs,
+      nextEpisodeTimestamp: hasUpcoming ? upcomingFromNext!.timestamp : null,
+      formattedDateStr: formatToLocalDisplay(prevTs),
+      date: new Date(prevTs),
+      label: labelStr,
+      isOut: true,
+      isPastWindow: false,
+      isFuture: false,
+      isNextEpisode: hasUpcoming,
+      outNowEpisode: outNowFromPrev,
+      upcomingEpisode: upcomingFromNext,
+    };
+  }
+
+  // 2. Check user-entered primary releaseDate within 24h window
+  if (primaryTs !== null && now >= primaryTs && now < primaryTs + TWENTY_FOUR_HOURS_MS) {
+    const dateLabel = formatToLocalDisplay(primaryTs);
+    return {
+      timestamp: primaryTs,
+      outNowTimestamp: primaryTs,
+      nextEpisodeTimestamp: null,
+      formattedDateStr: dateLabel,
+      date: new Date(primaryTs),
+      label: show.releaseNote || dateLabel,
+      isOut: true,
+      isPastWindow: false,
+      isFuture: false,
+      isNextEpisode: false,
+      outNowEpisode: {
+        name: show.title,
+        timestamp: primaryTs,
+        airdate: show.releaseDate,
+      },
+    };
+  }
+
+  // RULE B: FUTURE UPCOMING EPISODES (COUNTDOWN)
+  // 1. Live TVMaze upcoming episode
+  if (isSeries && nextTs !== null && nextTs > now) {
+    const dateLabel = formatToLocalDisplay(nextTs);
+    return {
+      timestamp: nextTs,
+      outNowTimestamp: null,
+      nextEpisodeTimestamp: nextTs,
+      formattedDateStr: dateLabel,
+      date: new Date(nextTs),
+      label: upcomingFromNext?.season && upcomingFromNext?.number
+        ? `${dateLabel} (S${upcomingFromNext.season} E${upcomingFromNext.number})`
+        : dateLabel,
+      isOut: false,
+      isPastWindow: false,
+      isFuture: true,
+      isNextEpisode: true,
+      upcomingEpisode: upcomingFromNext,
+    };
+  }
+
+  // 2. User-entered primary future release date
+  if (primaryTs !== null && primaryTs > now) {
+    const dateLabel = formatToLocalDisplay(primaryTs);
+    return {
+      timestamp: primaryTs,
+      outNowTimestamp: null,
+      nextEpisodeTimestamp: primaryTs,
+      formattedDateStr: dateLabel,
+      date: new Date(primaryTs),
+      label: show.releaseNote || dateLabel,
+      isOut: false,
+      isPastWindow: false,
+      isFuture: true,
+      isNextEpisode: false,
+    };
+  }
+
+  // RULE C: EXPIRED BEYOND 24 HOURS (Cleanly switch or finish)
+  if (
+    (prevTs !== null && now >= prevTs + TWENTY_FOUR_HOURS_MS && (!nextTs || nextTs <= now)) ||
+    (primaryTs !== null && now >= primaryTs + TWENTY_FOUR_HOURS_MS)
+  ) {
+    return {
+      timestamp: nextTs || primaryTs || prevTs,
+      outNowTimestamp: null,
+      nextEpisodeTimestamp: null,
+      formattedDateStr: formatToLocalDisplay(nextTs || primaryTs || prevTs),
+      date: new Date(nextTs || primaryTs || prevTs || 0),
+      label: show.releaseNote || 'Released',
+      isOut: false,
+      isPastWindow: true,
+      isFuture: false,
+      isNextEpisode: false,
+    };
+  }
+
+  return {
+    timestamp: null,
+    formattedDateStr: '',
+    date: null,
+    label: show.releaseNote || 'Coming Soon',
+    isOut: false,
+    isPastWindow: false,
+    isFuture: false,
+    isNextEpisode: false,
+  };
+}
+
+export function isShowOutNow(
+  show: ShowItem,
+  liveAirstampOrTvMaze?: string | TvMazeShowInfo | null
+): boolean {
+  return getEffectiveReleaseInfo(show, liveAirstampOrTvMaze).isOut;
 }
 
 /**

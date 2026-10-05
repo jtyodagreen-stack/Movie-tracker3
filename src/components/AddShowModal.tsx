@@ -8,6 +8,7 @@ import { autoFetchPoster, searchLiveSuggestions, getImdbSearchUrl, LiveSearchIte
 import { fetchLiveTvMazeInfo, TvMazeShowInfo, TvMazeEpisode } from '../services/tvMazeService';
 import { extractDateOnly, extractTimeOnly, combineDateAndTime, formatToDDMMYYYY, formatToYYYYMMDD, getTodayDDMMYYYY } from '../utils/dateUtils';
 import { enableShowNotificationSilent } from '../services/notificationService';
+import { normalizeTitleForComparison } from '../utils/showMetrics';
 
 interface AddShowModalProps {
   isOpen: boolean;
@@ -140,9 +141,17 @@ export default function AddShowModal({
   const [destination, setDestination] = useState<'master' | 'wishlist'>(
     initialIsWishlist ? 'wishlist' : 'master'
   );
+  const [isSubmitting, setIsSubmitting] = useState(false);
   const [title, setTitle] = useState('');
   const [duplicateError, setDuplicateError] = useState('');
   const [duplicateShowItem, setDuplicateShowItem] = useState<ShowItem | null>(null);
+  const [allowDuplicateOverride, setAllowDuplicateOverride] = useState(false);
+
+  useEffect(() => {
+    if (isOpen) {
+      setIsSubmitting(false);
+    }
+  }, [isOpen]);
 
   // Dynamic Library Counter
   const totalLibraryShows = shows.length;
@@ -386,21 +395,50 @@ export default function AddShowModal({
 
   if (!isOpen) return null;
 
+  // Real-time Duplicate Checking Effect as user types or alters title/IMDb
+  useEffect(() => {
+    if (allowDuplicateOverride) return;
+    const cleanCand = normalizeTitleForComparison(title);
+    if (!cleanCand || cleanCand.length < 2) {
+      setDuplicateShowItem(null);
+      setDuplicateError('');
+      return;
+    }
+
+    const currentImdb = imdbId || posterResult?.imdbId;
+    const dupe = shows.find((s) => {
+      if (currentImdb && s.imdbId && currentImdb.trim().toLowerCase() === s.imdbId.trim().toLowerCase()) return true;
+      if (!s.title) return false;
+      const cleanExisting = normalizeTitleForComparison(s.title);
+      return cleanExisting.length >= 2 && cleanCand === cleanExisting;
+    });
+
+    if (dupe) {
+      setDuplicateShowItem(dupe);
+      setDuplicateError(
+        `🚫 Duplicate Found: "${dupe.title}" is already in your ${dupe.isWishlist ? 'Wishlist' : 'Master Tracker'} (${dupe.status} • ${dupe.platform || 'Tracker'}).`
+      );
+    } else {
+      setDuplicateShowItem(null);
+      setDuplicateError('');
+    }
+  }, [title, imdbId, posterResult?.imdbId, shows, allowDuplicateOverride]);
+
   const handleSelectLiveSuggestion = (item: LiveSearchItem) => {
     setTitle(item.title);
     setType(item.type);
 
     // Check duplicate upon selecting suggestion
-    const cleanCand = item.title.trim().toLowerCase().replace(/[^a-z0-9]/g, '');
+    const cleanCand = normalizeTitleForComparison(item.title);
     const currentImdb = item.imdbId;
     const dupe = cleanCand.length >= 2 ? shows.find((s) => {
-      if (currentImdb && s.imdbId && currentImdb === s.imdbId) return true;
+      if (currentImdb && s.imdbId && currentImdb.trim().toLowerCase() === s.imdbId.trim().toLowerCase()) return true;
       if (!s.title) return false;
-      const cleanExisting = s.title.trim().toLowerCase().replace(/[^a-z0-9]/g, '');
+      const cleanExisting = normalizeTitleForComparison(s.title);
       return cleanExisting.length >= 2 && cleanCand === cleanExisting;
     }) : null;
 
-    if (dupe) {
+    if (dupe && !allowDuplicateOverride) {
       setDuplicateShowItem(dupe);
       setDuplicateError(
         `🚫 Duplicate Found: "${dupe.title}" is already in your ${dupe.isWishlist ? 'Wishlist' : 'Master Tracker'} (${dupe.status} • ${dupe.platform || 'Tracker'}).`
@@ -450,7 +488,8 @@ export default function AddShowModal({
           setReleaseDateOnly(nextEp.airdate);
           setReleaseTime(nextEp.airtime || '00:00');
           setReleaseNote(`S${nextEp.season} E${nextEp.number}: ${nextEp.name}`);
-          setReleaseDate(combineDateAndTime(nextEp.airdate, nextEp.airtime || '00:00'));
+          // Store absolute airstamp for perfect precision
+          setReleaseDate(nextEp.airstamp || combineDateAndTime(nextEp.airdate, nextEp.airtime || '00:00'));
         }
       }).catch(err => console.warn(err))
         .finally(() => setIsLoadingTvMaze(false));
@@ -477,6 +516,9 @@ export default function AddShowModal({
       if (activeSuggestionIndex >= 0 && activeSuggestionIndex < liveSuggestions.length) {
         e.preventDefault();
         handleSelectLiveSuggestion(liveSuggestions[activeSuggestionIndex]);
+      } else {
+        e.preventDefault();
+        executeAdd(false);
       }
     } else if (e.key === 'Escape') {
       setShowSuggestions(false);
@@ -489,26 +531,30 @@ export default function AddShowModal({
     setBackdropUrl(candidate.posterUrl);
   };
 
-  const handleSubmit = (e: React.FormEvent) => {
-    e.preventDefault();
+  const executeAdd = (bypassDuplicate: boolean = false) => {
     if (!title.trim()) return;
+    if (isSubmitting) return;
+    setIsSubmitting(true);
 
-    // Strict Duplicate Title Check upon submission
-    const cleanCand = title.trim().toLowerCase().replace(/[^a-z0-9]/g, '');
-    const currentImdb = imdbId || posterResult?.imdbId;
-    const dupe = cleanCand.length >= 2 ? shows.find((s) => {
-      if (currentImdb && s.imdbId && currentImdb === s.imdbId) return true;
-      if (!s.title) return false;
-      const cleanExisting = s.title.trim().toLowerCase().replace(/[^a-z0-9]/g, '');
-      return cleanExisting.length >= 2 && cleanCand === cleanExisting;
-    }) : null;
+    // Strict Duplicate Title Check unless user intentionally selected "Add Anyway"
+    if (!bypassDuplicate && !allowDuplicateOverride) {
+      const cleanCand = normalizeTitleForComparison(title);
+      const currentImdb = imdbId || posterResult?.imdbId;
+      const dupe = cleanCand.length >= 2 ? shows.find((s) => {
+        if (currentImdb && s.imdbId && currentImdb.trim().toLowerCase() === s.imdbId.trim().toLowerCase()) return true;
+        if (!s.title) return false;
+        const cleanExisting = normalizeTitleForComparison(s.title);
+        return cleanExisting.length >= 2 && cleanCand === cleanExisting;
+      }) : null;
 
-    if (dupe) {
-      setDuplicateShowItem(dupe);
-      setDuplicateError(
-        `🚫 Duplicate Found: "${dupe.title}" is already in your ${dupe.isWishlist ? 'Wishlist' : 'Master Tracker'} (${dupe.status} • ${dupe.platform || 'Tracker'}).`
-      );
-      return;
+      if (dupe) {
+        setDuplicateShowItem(dupe);
+        setDuplicateError(
+          `🚫 Duplicate Found: "${dupe.title}" is already in your ${dupe.isWishlist ? 'Wishlist' : 'Master Tracker'} (${dupe.status} • ${dupe.platform || 'Tracker'}).`
+        );
+        setIsSubmitting(false);
+        return;
+      }
     }
 
     const resolvedPlatform = platform;
@@ -592,7 +638,20 @@ export default function AddShowModal({
     setRatingNum(0);
     setReleaseDate('');
     setReleaseNote('');
+    setDuplicateShowItem(null);
+    setDuplicateError('');
+    setAllowDuplicateOverride(false);
     onClose();
+  };
+
+  const handleAddAnyway = () => {
+    setAllowDuplicateOverride(true);
+    executeAdd(true);
+  };
+
+  const handleSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    executeAdd(false);
   };
 
   const currentEffectivePoster =
@@ -656,18 +715,28 @@ export default function AddShowModal({
               type="submit"
               form="add-show-form"
               id="add-top-save-btn"
-              disabled={Boolean(duplicateShowItem && duplicateError)}
+              disabled={Boolean(duplicateShowItem && duplicateError && !allowDuplicateOverride) || isSubmitting}
               data-preserve-theme="true"
               className="preserve-theme-color flex items-center gap-1.5 text-xs font-bold px-3 py-1.5 rounded-full shadow-md transition-all"
               style={
-                Boolean(duplicateShowItem && duplicateError)
-                  ? { backgroundColor: '#450a0a', color: '#fca5a5', border: '2px solid #dc2626', cursor: 'not-allowed' }
+                Boolean(duplicateShowItem && duplicateError && !allowDuplicateOverride) || isSubmitting
+                  ? { backgroundColor: '#450a0a', color: '#fca5a5', border: '2px solid #dc2626', cursor: 'not-allowed', opacity: 0.6 }
                   : { backgroundColor: '#059669', color: '#ffffff', border: '1px solid rgba(16, 185, 129, 0.5)', cursor: 'pointer' }
               }
             >
               <Save className="w-3.5 h-3.5" />
-              <span className="hidden sm:inline">{Boolean(duplicateShowItem && duplicateError) ? '🚫 Duplicate' : 'Add Title'}</span>
-              <span className="sm:hidden">{Boolean(duplicateShowItem && duplicateError) ? 'Duplicate' : 'Add'}</span>
+              <span className="hidden sm:inline">
+                {isSubmitting
+                  ? 'Saving...'
+                  : Boolean(duplicateShowItem && duplicateError && !allowDuplicateOverride)
+                  ? '🚫 Duplicate'
+                  : allowDuplicateOverride
+                  ? 'Add Title (Separate)'
+                  : 'Add Title'}
+              </span>
+              <span className="sm:hidden">
+                {isSubmitting ? 'Saving...' : Boolean(duplicateShowItem && duplicateError && !allowDuplicateOverride) ? 'Duplicate' : 'Add'}
+              </span>
             </button>
             <button
               id="close-add-modal-btn"
@@ -883,7 +952,7 @@ export default function AddShowModal({
           {/* Real-time Duplicate Found Warning Indicator */}
           {(() => {
             const activeDuplicate = duplicateShowItem;
-            if (!activeDuplicate) return null;
+            if (!activeDuplicate || allowDuplicateOverride) return null;
             return (
               <div
                 id="duplicate-title-warning-box"
@@ -891,8 +960,8 @@ export default function AddShowModal({
                 className="preserve-theme-color p-4 rounded-xl space-y-3 text-white shadow-2xl animate-in fade-in slide-in-from-top-2 duration-200"
                 style={{ backgroundColor: 'rgba(69, 10, 10, 0.95)', border: '2px solid #ef4444' }}
               >
-                <div className="flex items-start justify-between gap-3">
-                  <div className="flex items-start gap-3 min-w-0">
+                <div className="flex flex-col sm:flex-row sm:items-start justify-between gap-3">
+                  <div className="flex items-start gap-3 min-w-0 flex-1">
                     <div
                       data-preserve-theme="true"
                       className="preserve-theme-color w-8 h-8 rounded-lg flex items-center justify-center shrink-0 mt-0.5"
@@ -914,25 +983,35 @@ export default function AddShowModal({
                         </span>
                       </div>
                       <p className="text-xs leading-relaxed" style={{ color: 'rgba(254, 202, 202, 0.95)' }}>
-                        This show is already in your <strong>{activeDuplicate.isWishlist ? 'Wishlist' : 'Master Tracker'}</strong> ({activeDuplicate.status} • {activeDuplicate.platform || 'Tracker'}). Duplicate titles cannot be added.
+                        This show is already in your <strong>{activeDuplicate.isWishlist ? 'Wishlist' : 'Master Tracker'}</strong> ({activeDuplicate.status} • {activeDuplicate.platform || 'Tracker'}).
                       </p>
                     </div>
                   </div>
 
-                  {onSelectExistingShow && (
+                  <div className="flex items-center gap-2 shrink-0 self-end sm:self-auto flex-wrap">
+                    {onSelectExistingShow && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          onClose();
+                          onSelectExistingShow(activeDuplicate);
+                        }}
+                        data-preserve-theme="true"
+                        className="preserve-theme-color text-xs text-white font-black px-3.5 py-2 rounded-lg shadow-lg hover:scale-105 active:scale-95 transition-all shrink-0 cursor-pointer whitespace-nowrap"
+                        style={{ backgroundColor: '#dc2626', border: '1px solid rgba(248, 113, 113, 0.6)' }}
+                      >
+                        Open Existing Show →
+                      </button>
+                    )}
                     <button
                       type="button"
-                      onClick={() => {
-                        onClose();
-                        onSelectExistingShow(activeDuplicate);
-                      }}
-                      data-preserve-theme="true"
-                      className="preserve-theme-color text-xs text-white font-black px-3.5 py-2 rounded-lg shadow-lg hover:scale-105 active:scale-95 transition-all shrink-0 cursor-pointer whitespace-nowrap"
-                      style={{ backgroundColor: '#dc2626', border: '1px solid rgba(248, 113, 113, 0.6)' }}
+                      onClick={handleAddAnyway}
+                      className="text-xs bg-zinc-800 hover:bg-zinc-700 text-zinc-100 font-bold px-3.5 py-2 rounded-lg border border-zinc-600 shadow-md hover:scale-105 active:scale-95 transition-all shrink-0 cursor-pointer whitespace-nowrap"
+                      title="Add as a separate title or version (e.g. remake, different year, or adaptation)"
                     >
-                      Open Existing Show →
+                      Add Anyway
                     </button>
-                  )}
+                  </div>
                 </div>
               </div>
             );

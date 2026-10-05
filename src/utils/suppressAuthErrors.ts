@@ -1,3 +1,7 @@
+if (typeof self !== 'undefined' && typeof window === 'undefined') {
+  (self as any).window = self;
+}
+
 if (typeof window !== 'undefined') {
   const extractText = (val: any): string => {
     if (val === null || val === undefined) return '';
@@ -22,7 +26,14 @@ if (typeof window !== 'undefined') {
       const fullText = args.map(extractText).join(' ');
       return (
         fullText.includes('Pending promise was never set') ||
-        fullText.includes('INTERNAL ASSERTION FAILED')
+        fullText.includes('INTERNAL ASSERTION FAILED') ||
+        fullText.includes('Could not reach Cloud Firestore backend') ||
+        fullText.includes('[code=unavailable]') ||
+        fullText.includes('No tab with id') ||
+        fullText.includes('Frame with ID') ||
+        fullText.includes('Receiving end does not exist') ||
+        fullText.includes('message port closed') ||
+        fullText.includes('window is not defined')
       );
     } catch {
       return false;

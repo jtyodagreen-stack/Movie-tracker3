@@ -451,9 +451,11 @@ export default function SettingsCenterModal({
   const handleSyncNow = () => {
     if (onTriggerSync) {
       onTriggerSync();
+      toast.success('⚡ Requesting full library update from Sheets...', { duration: 5000 });
     } else {
       toast('⏱️ Syncing with Google Sheet...');
     }
+    onClose();
   };
 
   // Handle full authentication popup and sheet reconnect
@@ -469,6 +471,7 @@ export default function SettingsCenterModal({
         onTriggerSync();
       }
       toast.success('⚡ Connected and synced Google Sheets successfully!', { id: 'resync-loader', duration: 5000 });
+      onClose();
     } catch (err: any) {
       toast.error('🔐 Connection cancelled — you can try again anytime', { id: 'resync-loader' });
     }
@@ -519,6 +522,7 @@ export default function SettingsCenterModal({
     if (onTriggerSync) {
       onTriggerSync();
       toast.success('⚡ Requesting full library update from Sheets...', { duration: 5000 });
+      onClose();
     } else {
       toast.error("🔌 Offline — will sync when you're back online");
     }

@@ -116,6 +116,73 @@ export function combineDateAndTime(dateStr?: string | null, timeStr?: string | n
   return ddmmyyyy;
 }
 
-/* 
- * Helper functions for date parsing and formatting.
+/**
+ * Formats any date input into a user-friendly local display string: "DD-MM-YYYY at HH:mm"
+ * Automatically uses the device's local time zone.
  */
+export function formatToLocalDisplay(dateInput?: Date | string | number | null): string {
+  if (!dateInput) return '';
+  
+  let d: Date | null = null;
+  if (dateInput instanceof Date) {
+    d = dateInput;
+  } else if (typeof dateInput === 'number') {
+    d = new Date(dateInput);
+  } else {
+    d = parseAnyDate(dateInput);
+  }
+
+  if (!d || isNaN(d.getTime())) return '';
+
+  const day = String(d.getDate()).padStart(2, '0');
+  const month = String(d.getMonth() + 1).padStart(2, '0');
+  const year = d.getFullYear();
+  const hours = String(d.getHours()).padStart(2, '0');
+  const minutes = String(d.getMinutes()).padStart(2, '0');
+  
+  return `${day}-${month}-${year} at ${hours}:${minutes}`;
+}
+
+export function isNewShow(show: {
+  isWishlist?: boolean;
+  status?: string;
+  sheetTabName?: string;
+  addedTime?: number;
+  createdTimestamp?: number;
+  sessionAddedAt?: number;
+  dateAdded?: string;
+}): boolean {
+  if (
+    !show ||
+    show.isWishlist ||
+    String(show.status || '').toLowerCase().includes('wishlist') ||
+    show.sheetTabName?.toLowerCase().includes('wishlist')
+  ) {
+    return false;
+  }
+
+  // Rule: HIDE if in Continue Watching (status is "Watching")
+  const statusStr = String(show.status || '').toLowerCase();
+  if (statusStr.includes('watching') || statusStr.includes('in progress') || statusStr.includes('⏳')) {
+    return false;
+  }
+
+  const ONE_DAY_MS = 24 * 60 * 60 * 1000;
+  const now = Date.now();
+
+  const addedTime = show.addedTime || show.createdTimestamp || show.sessionAddedAt;
+  if (addedTime) {
+    const diff = now - addedTime;
+    if (diff >= 0 && diff <= ONE_DAY_MS) return true;
+  }
+
+  if (show.dateAdded) {
+    const parsed = parseAnyDate(show.dateAdded);
+    if (parsed) {
+      const diff = now - parsed.getTime();
+      if (diff >= 0 && diff <= ONE_DAY_MS) return true;
+    }
+  }
+
+  return false;
+}

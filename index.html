@@ -1,8 +1,14 @@
 <!doctype html>
 <html lang="en" class="bg-[#141414] text-white" style="background-color: #141414;">
   <head>
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self' https: data: blob:; script-src 'self' 'unsafe-inline' 'unsafe-eval' https://*.google.com https://*.googleapis.com https://*.gstatic.com https://*.googleusercontent.com https://*.firebaseapp.com https://*.run.app; style-src 'self' 'unsafe-inline' https: https://fonts.googleapis.com; img-src 'self' https: data: blob:; connect-src 'self' https: wss: data: blob: https://*.googleapis.com https://*.google.com https://*.firebaseio.com https://identitytoolkit.googleapis.com https://securetoken.googleapis.com https://api.tvmaze.com https://en.wikipedia.org https://formsubmit.co https://*.run.app https://*.googleusercontent.com; font-src 'self' https: data: https://fonts.gstatic.com; frame-src 'self' https:;" />
     <script>
       (function() {
+        // Safe global window/self object polyfill for background workers
+        if (typeof self !== 'undefined' && typeof window === 'undefined') {
+          self.window = self;
+        }
+
         function extractText(val) {
           if (val === null || val === undefined) return '';
           if (typeof val === 'string') return val;
@@ -19,7 +25,7 @@
           return String(val);
         }
 
-        function isAssertionError(args) {
+        function isIgnorableError(args) {
           try {
             var fullText = Array.prototype.slice.call(args).map(function(item) {
               if (Array.isArray(item)) {
@@ -27,7 +33,15 @@
               }
               return extractText(item);
             }).join(' ');
-            return fullText.indexOf('Pending promise was never set') !== -1 || fullText.indexOf('INTERNAL ASSERTION FAILED') !== -1;
+            return (
+              fullText.indexOf('Pending promise was never set') !== -1 ||
+              fullText.indexOf('INTERNAL ASSERTION FAILED') !== -1 ||
+              fullText.indexOf('No tab with id') !== -1 ||
+              fullText.indexOf('Frame with ID') !== -1 ||
+              fullText.indexOf('Receiving end does not exist') !== -1 ||
+              fullText.indexOf('message port closed') !== -1 ||
+              fullText.indexOf('window is not defined') !== -1
+            );
           } catch(e) {
             return false;
           }
@@ -35,31 +49,31 @@
 
         var origAssert = console.assert;
         console.assert = function(condition) {
-          if (!condition && isAssertionError(arguments)) return;
+          if (!condition && isIgnorableError(arguments)) return;
           if (origAssert) origAssert.apply(console, arguments);
         };
 
         var origErr = console.error;
         console.error = function() {
-          if (isAssertionError(arguments)) return;
+          if (isIgnorableError(arguments)) return;
           origErr.apply(console, arguments);
         };
 
         var origWarn = console.warn;
         console.warn = function() {
-          if (isAssertionError(arguments)) return;
+          if (isIgnorableError(arguments)) return;
           origWarn.apply(console, arguments);
         };
 
         var origLog = console.log;
         console.log = function() {
-          if (isAssertionError(arguments)) return;
+          if (isIgnorableError(arguments)) return;
           origLog.apply(console, arguments);
         };
 
         window.onerror = function(message, source, lineno, colno, error) {
           var text = extractText([message, error]);
-          if (text.indexOf('Pending promise was never set') !== -1 || text.indexOf('INTERNAL ASSERTION FAILED') !== -1) {
+          if (isIgnorableError([text])) {
             return true;
           }
           return false;
@@ -69,7 +83,7 @@
           var origReportError = window.reportError;
           window.reportError = function(err) {
             var text = extractText([err]);
-            if (text.indexOf('Pending promise was never set') !== -1 || text.indexOf('INTERNAL ASSERTION FAILED') !== -1) {
+            if (isIgnorableError([text])) {
               return;
             }
             origReportError.call(window, err);
@@ -78,7 +92,7 @@
 
         window.addEventListener('error', function(e) {
           var text = extractText([e.message, e.error, e.filename]);
-          if (text.indexOf('Pending promise was never set') !== -1 || text.indexOf('INTERNAL ASSERTION FAILED') !== -1) {
+          if (isIgnorableError([text])) {
             e.preventDefault();
             e.stopImmediatePropagation();
           }
@@ -86,7 +100,7 @@
 
         window.addEventListener('unhandledrejection', function(e) {
           var text = extractText([e.reason]);
-          if (text.indexOf('Pending promise was never set') !== -1 || text.indexOf('INTERNAL ASSERTION FAILED') !== -1) {
+          if (isIgnorableError([text])) {
             e.preventDefault();
             e.stopImmediatePropagation();
           }

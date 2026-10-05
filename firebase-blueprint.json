@@ -126,12 +126,36 @@
     },
     "sync_control": {
       "title": "SyncControl",
-      "description": "Used to trigger instant cross-device UI refreshes",
+      "description": "Used to trigger instant cross-device UI refreshes and real-time show additions and removals",
       "type": "object",
       "properties": {
         "lastUpdated": {
           "type": "number",
           "description": "Timestamp of last change"
+        },
+        "action": {
+          "type": "string",
+          "description": "Sync action type such as DELETE, ADD, or UPDATE"
+        },
+        "deletedShowId": {
+          "type": "string",
+          "description": "ID of the deleted show"
+        },
+        "deletedTitle": {
+          "type": "string",
+          "description": "Title of the deleted show"
+        },
+        "deletedTitleNorm": {
+          "type": "string",
+          "description": "Normalized title of the deleted show for matching"
+        },
+        "deviceId": {
+          "type": "string",
+          "description": "Identifier of the device originating the action"
+        },
+        "deletedKeys": {
+          "type": "array",
+          "description": "List of recently deleted show keys for cross-device tombstoning"
         }
       },
       "required": ["lastUpdated"]

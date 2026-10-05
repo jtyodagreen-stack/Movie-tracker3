@@ -4,7 +4,7 @@ import { ShowItem } from '../types';
 import { useNotificationContext } from '../context/NotificationContext';
 import { getOptimizedPoster } from '../utils/imageOptimizer';
 import { calculateShowProgress } from '../utils/showMetrics';
-import { isShowOutNow, parseReleaseDateToTimestamp, isReleaseDatePast } from '../services/notificationService';
+import { isShowOutNow, parseReleaseDateToTimestamp, isReleaseDatePast, getEffectiveReleaseInfo } from '../services/notificationService';
 import { getPriorityIndicator } from '../utils/priorityUtils';
 import { formatToDDMMYYYY } from '../utils/dateUtils';
 
@@ -22,6 +22,14 @@ export default function ShowcaseSection({
   onNavigateToFilter,
 }: ShowcaseSectionProps) {
   const { isNotificationEnabled, toggleNotification } = useNotificationContext();
+  const [now, setNow] = React.useState<number>(Date.now());
+
+  React.useEffect(() => {
+    const interval = setInterval(() => {
+      setNow(Date.now());
+    }, 10000); // Tick every 10 seconds to update release times
+    return () => clearInterval(interval);
+  }, []);
 
   const handleToggleNotif = async (e: React.MouseEvent, show: ShowItem) => {
     e.stopPropagation();
@@ -52,39 +60,34 @@ export default function ShowcaseSection({
   const comingSoonList = useMemo(() => {
     return shows
       .filter((s) => Boolean(s.releaseDate || s.releaseNote || s.nextAirDate || s.nextAirTimestamp))
+      .map((s) => ({ ...s, effectiveInfo: getEffectiveReleaseInfo(s) }))
+      .filter((s) => !s.effectiveInfo.isPastWindow || s.releaseNote)
       .sort((a, b) => {
-        const outNowA = isShowOutNow(a);
-        const outNowB = isShowOutNow(b);
+        const outNowA = a.effectiveInfo.isOut;
+        const outNowB = b.effectiveInfo.isOut;
 
-        // 1. "Out Now" titles first
+        // 1. Active "OUT NOW" releases first
         if (outNowA && !outNowB) return -1;
         if (!outNowA && outNowB) return 1;
 
-        // 2. For other titles, check future vs past
-        const now = Date.now();
-        const tsA = (a.releaseDate ? parseReleaseDateToTimestamp(a.releaseDate) : a.nextAirTimestamp) || 0;
-        const tsB = (b.releaseDate ? parseReleaseDateToTimestamp(b.releaseDate) : b.nextAirTimestamp) || 0;
-
-        const aIsFuture = tsA > now;
-        const bIsFuture = tsB > now;
-
-        if (aIsFuture && !bIsFuture) return -1;
-        if (!aIsFuture && bIsFuture) return 1;
-
-        // 3. Sort by closest date (earliest first for future, or latest first for past)
-        if (tsA && tsB) {
-          if (aIsFuture) {
-            return tsA - tsB; // Earliest future date first
-          } else {
-            return tsB - tsA; // Latest past date first
-          }
+        // If both are OUT NOW, sort by release time (latest release first)
+        if (outNowA && outNowB) {
+          const tsA = a.effectiveInfo.timestamp || 0;
+          const tsB = b.effectiveInfo.timestamp || 0;
+          return tsB - tsA;
         }
+
+        // 2. Upcoming future releases: Sort strictly by NEAREST date/time FIRST (soonest at TOP → furthest at BOTTOM)
+        const tsA = a.effectiveInfo.timestamp || 0;
+        const tsB = b.effectiveInfo.timestamp || 0;
+
+        if (tsA && tsB) return tsA - tsB; // Soonest countdown (earliest future date/time) first!
         if (tsA) return -1;
         if (tsB) return 1;
         return (a.releaseNote || a.title).localeCompare(b.releaseNote || b.title);
       })
       .slice(0, 10);
-  }, [shows]);
+  }, [shows, now]);
 
   if (!isLoading && shows.length === 0) return null;
 
@@ -94,12 +97,12 @@ export default function ShowcaseSection({
         {/* Active Watching In-Progress */}
         <div className="bg-[#181818] border border-zinc-800 rounded-2xl p-4 shadow-xl flex flex-col justify-between">
           <div>
-            <div className="flex items-center justify-between border-b border-zinc-800/80 pb-3 mb-3">
+            <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-1.5 sm:gap-2 border-b border-zinc-800/80 pb-3 mb-3">
               <div className="flex items-center gap-2">
                 <Play className="w-4 h-4 text-amber-500 fill-current" />
                 <h3 className="text-sm font-bold text-white tracking-tight">Currently In-Progress Shows</h3>
               </div>
-              <span className="text-xs bg-amber-500/20 text-amber-400 px-2 py-0.5 rounded font-mono font-bold">
+              <span className="text-xs bg-amber-500/20 text-amber-400 px-2 py-0.5 rounded font-mono font-bold self-start sm:self-auto">
                 {isLoading ? '...' : inProgressList.length} titles
               </span>
             </div>
@@ -206,12 +209,12 @@ export default function ShowcaseSection({
         {/* Top Rated Titles */}
         <div className="bg-[#181818] border border-zinc-800 rounded-2xl p-4 shadow-xl flex flex-col justify-between">
           <div>
-            <div className="flex items-center justify-between border-b border-zinc-800/80 pb-3 mb-3">
+            <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-1.5 sm:gap-2 border-b border-zinc-800/80 pb-3 mb-3">
               <div className="flex items-center gap-2">
                 <Star className="w-4 h-4 text-yellow-400 fill-yellow-400" />
                 <h3 className="text-sm font-bold text-white tracking-tight">Top Rated Titles (4–5 Stars)</h3>
               </div>
-              <span className="text-xs bg-yellow-500/20 text-yellow-400 px-2 py-0.5 rounded font-mono font-bold">
+              <span className="text-xs bg-yellow-500/20 text-yellow-400 px-2 py-0.5 rounded font-mono font-bold self-start sm:self-auto">
                 {topRatedList.length} titles
               </span>
             </div>
@@ -318,31 +321,21 @@ export default function ShowcaseSection({
         {/* Coming Soon & Premieres Section */}
         <div className="bg-[#181818] border border-zinc-800 rounded-2xl p-4 shadow-xl flex flex-col justify-between md:col-span-2 lg:col-span-1">
           <div>
-            <div className="flex items-center justify-between border-b border-zinc-800/80 pb-3 mb-3">
+            <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-1.5 sm:gap-2 border-b border-zinc-800/80 pb-3 mb-3">
               <div className="flex items-center gap-2">
                 <Calendar className="w-4 h-4 text-amber-500 fill-amber-500/20" />
                 <h3 className="text-sm font-bold text-white tracking-tight">Upcoming Release Dates</h3>
               </div>
-              <span className="text-xs bg-amber-500/20 text-amber-400 px-2 py-0.5 rounded font-mono font-bold">
+              <span className="text-xs bg-amber-500/20 text-amber-400 px-2 py-0.5 rounded font-mono font-bold self-start sm:self-auto">
                 {comingSoonList.length} upcoming
               </span>
             </div>
 
             {comingSoonList.length > 0 ? (
               <div className="space-y-2.5">
-                {comingSoonList.map((show) => {
-                  const outNow = isShowOutNow(show);
-                  const isPast = isReleaseDatePast(show.releaseDate);
-                  const effectiveDate = (isPast && show.nextAirDate) 
-                    ? formatToDDMMYYYY(show.nextAirDate) 
-                    : (!isPast && show.releaseDate) 
-                    ? formatToDDMMYYYY(show.releaseDate) 
-                    : show.nextAirDate 
-                    ? formatToDDMMYYYY(show.nextAirDate) 
-                    : show.releaseDate 
-                    ? formatToDDMMYYYY(show.releaseDate) 
-                    : show.releaseNote || 'Coming Soon';
-                  const dateStr = outNow ? '🎉 OUT NOW' : effectiveDate;
+                {comingSoonList.map((show: any) => {
+                  const outNow = show.effectiveInfo.isOut;
+                  const dateStr = outNow ? '🎉 OUT NOW' : (show.effectiveInfo.label || 'Coming Soon');
 
                   return (
                     <div

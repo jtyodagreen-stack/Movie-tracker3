@@ -52,12 +52,19 @@ export interface ShowItem {
   nextEpisodeTitle?: string; // e.g. "Hello Ms. Cobel"
   nextSeasonNum?: number | string; // e.g. 2
   nextEpisodeNum?: number | string; // e.g. 1
+  lastAirDate?: string; // Formatted as DD-MM-YYYY
+  lastAirTime?: string; // e.g. "21:00"
+  lastAirTimestamp?: number; // Epoch ms of most recently aired episode (for 24h OUT NOW window)
+  lastEpisodeTitle?: string;
+  lastSeasonNum?: number | string;
+  lastEpisodeNum?: number | string;
   airScheduleText?: string; // e.g. "Airs Fridays at 21:00 on Apple TV+"
   isOngoing?: boolean; // True if series is actively airing or has upcoming season premiere
   scheduleStatus?: string; // e.g. "Season 2 Premiere", "Weekly Episode", "Returning Series"
   releaseDate?: string; // Target Premiere/Release date (e.g. DD-MM-YYYY)
   releaseNote?: string; // Premiere/Countdown note (e.g. "Season 5 Premiere")
   notify24h?: boolean; // Whether 24h release reminder notification is enabled
+  allowDuplicate?: boolean; // Whether user explicitly confirmed adding despite duplicate title
   trailerUrl?: string; // Custom YouTube trailer URL or share link
   trailerYoutubeId?: string; // Extracted 11-char YouTube Video ID
 }

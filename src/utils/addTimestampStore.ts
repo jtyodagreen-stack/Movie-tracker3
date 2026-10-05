@@ -170,8 +170,6 @@ export function verifyAndBackfillShowTimestamps(
   const isIOS = isIOSDevice();
   let healedCount = 0;
   let verifiedCount = 0;
-  const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
-  const now = Date.now();
 
   for (const show of shows) {
     if (!show || (!show.id && !show.title)) continue;

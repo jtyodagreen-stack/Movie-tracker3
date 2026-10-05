@@ -32,6 +32,7 @@ interface ShowRowProps {
   emptyState?: ShowRowEmptyState;
   viewerColors?: Record<string, string>;
   headerAction?: React.ReactNode;
+  titleInlineAction?: React.ReactNode;
   showNewBadge?: boolean;
 }
 
@@ -50,6 +51,7 @@ export default function ShowRow({
   emptyState,
   viewerColors,
   headerAction,
+  titleInlineAction,
   showNewBadge,
 }: ShowRowProps) {
   const rowRef = useRef<HTMLDivElement>(null);
@@ -69,26 +71,27 @@ export default function ShowRow({
   return (
     <section id={`row-${id}`} className="relative py-4 group">
       {/* Header */}
-      <div className="max-w-7xl mx-auto px-2 sm:px-6 lg:px-8 mb-3 flex items-center justify-between gap-2">
+      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 mb-3 flex items-center justify-between gap-2 flex-wrap sm:flex-nowrap">
         <div
-          className={`flex items-baseline gap-2 ${
+          className={`flex items-baseline gap-2 flex-wrap ${
             onTitleClick ? 'cursor-pointer group/title' : ''
           }`}
           onClick={onTitleClick}
         >
           <h2
-            className={`text-lg sm:text-xl font-bold text-white tracking-tight flex items-center gap-2 ${
+            className={`text-lg sm:text-xl font-bold text-white tracking-tight flex items-center gap-2 flex-wrap ${
               onTitleClick ? 'group-hover/title:text-red-500 transition-colors' : ''
             }`}
           >
-            {title}
+            <span>{title}</span>
             <span className="text-xs font-semibold px-2 py-0.5 rounded-full bg-zinc-800 text-zinc-400 border border-zinc-700/60 font-mono">
               {shows.length}
             </span>
+            {titleInlineAction}
           </h2>
           {subtitle && (
             <span
-              className={`text-xs text-zinc-400 hidden sm:inline ${
+              className={`text-xs text-zinc-400 inline ${
                 onTitleClick ? 'group-hover/title:text-zinc-300 transition-colors' : ''
               }`}
             >
@@ -97,7 +100,7 @@ export default function ShowRow({
           )}
         </div>
 
-        <div className="flex items-center gap-2 shrink-0">
+        <div className="flex items-center gap-2 shrink-0 pt-0.5 sm:pt-0">
           {headerAction}
           {onTitleClick && shows.length > 0 && (
             <button
@@ -113,7 +116,7 @@ export default function ShowRow({
       </div>
 
       {/* Row Content: Detailed Empty State OR Carousel */}
-      <div className="relative max-w-7xl mx-auto px-2 sm:px-6 lg:px-8">
+      <div className="relative max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
         {!isLoading && shows.length === 0 && emptyState ? (
           <div className="relative rounded-2xl border border-zinc-800/80 bg-gradient-to-br from-[#181818] via-zinc-900/60 to-zinc-950 p-5 sm:p-6 lg:p-7 overflow-hidden shadow-2xl backdrop-blur-sm">
             {/* Subtle glow decoration */}
@@ -241,7 +244,7 @@ export default function ShowRow({
               className="flex items-start gap-3 sm:gap-4 overflow-x-auto scrollbar-hide scroll-smooth pb-3 px-1"
               style={{ scrollbarWidth: 'none', msOverflowStyle: 'none' }}
             >
-              {isLoading ? (
+              {isLoading && shows.length === 0 ? (
                 Array.from({ length: 5 }).map((_, i) => (
                   <div key={i} className="flex-shrink-0 w-44 sm:w-56 md:w-64 space-y-2">
                     <Skeleton className="aspect-[16/10] w-full rounded-md" />

@@ -12,11 +12,15 @@ export interface AppDataCache {
   shows: any[];
   headers: string[];
   customViewers: string[];
+  viewerColors?: Record<string, string>;
   lastUpdated: number;
   spreadsheetId: string;
   sheetName: string;
   wishlistSheetName: string;
   showcaseSheetName: string;
+  sheetTitle?: string;
+  availableTabs?: string[];
+  dataSignature?: string;
 }
 
 export function getOfflineQueue(): OfflineAction[] {

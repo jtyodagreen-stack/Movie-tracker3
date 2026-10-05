@@ -19,6 +19,25 @@ export interface TvMazeShowInfo {
   officialSite?: string;
   nextEpisode?: TvMazeEpisode;
   previousEpisode?: TvMazeEpisode;
+  outNowEpisode?: TvMazeEpisode;
+}
+
+/**
+ * Extracts the exact epoch timestamp in milliseconds for a TVMaze episode.
+ * Prioritizes the definitive ISO airstamp (with network timezone), falling back to airdate + airtime.
+ */
+export function getTvMazeEpisodeTimestamp(ep?: TvMazeEpisode | null): number | null {
+  if (!ep) return null;
+  if (ep.airstamp) {
+    const ts = new Date(ep.airstamp).getTime();
+    if (!isNaN(ts)) return ts;
+  }
+  if (ep.airdate) {
+    const timeStr = ep.airtime && /^\d{1,2}:\d{2}$/.test(ep.airtime) ? ep.airtime : '20:00';
+    const ts = new Date(`${ep.airdate}T${timeStr}:00`).getTime();
+    if (!isNaN(ts)) return ts;
+  }
+  return null;
 }
 
 // In-memory cache for fast instant lookups across cards & modals
@@ -100,33 +119,45 @@ export async function fetchLiveTvMazeInfo(title: string): Promise<TvMazeShowInfo
     const TWENTY_FOUR_HOURS_MS = 24 * 60 * 60 * 1000;
 
     if (data._embedded) {
-      if (data._embedded.nextepisode) {
-        const nextEp = data._embedded.nextepisode;
-        const nextTime = nextEp.airstamp ? new Date(nextEp.airstamp).getTime() : (nextEp.airdate ? new Date(`${nextEp.airdate}T${nextEp.airtime || '00:00'}`).getTime() : 0);
-        // If nextEpisode is future or within 24h of airing, use it
-        if (nextTime >= now - TWENTY_FOUR_HOURS_MS) {
-          showInfo.nextEpisode = nextEp;
-        }
-      }
+      const episodesList: TvMazeEpisode[] = Array.isArray(data._embedded.episodes) ? data._embedded.episodes : [];
+      const embeddedPrev: TvMazeEpisode | undefined = data._embedded.previousepisode;
+      const embeddedNext: TvMazeEpisode | undefined = data._embedded.nextepisode;
 
-      if (data._embedded.previousepisode) {
-        showInfo.previousEpisode = data._embedded.previousepisode;
-      }
+      // 1. Check if embeddedNext has already reached its airstamp
+      const nextEpTs = getTvMazeEpisodeTimestamp(embeddedNext);
+      const prevEpTs = getTvMazeEpisodeTimestamp(embeddedPrev);
 
-      // If nextEpisode wasn't set or is already in the past (> 24h ago), search upcoming episodes list for the next future air date
-      if (!showInfo.nextEpisode && Array.isArray(data._embedded.episodes)) {
-        const upcomingEp = data._embedded.episodes.find((ep: TvMazeEpisode) => {
-          if (!ep) return false;
-          const epTime = ep.airstamp
-            ? new Date(ep.airstamp).getTime()
-            : ep.airdate
-            ? new Date(`${ep.airdate}T${ep.airtime || '00:00'}`).getTime()
-            : 0;
-          return epTime > now - TWENTY_FOUR_HOURS_MS;
+      // 2. Identify if an episode is currently within its exact 24h OUT NOW window
+      // Starts at exact airstamp (now >= ts) and stays for full 24h (now < ts + 24h)
+      let activeOutNow: TvMazeEpisode | undefined;
+      if (embeddedNext && nextEpTs !== null && now >= nextEpTs && now < nextEpTs + TWENTY_FOUR_HOURS_MS) {
+        activeOutNow = embeddedNext;
+      } else if (embeddedPrev && prevEpTs !== null && now >= prevEpTs && now < prevEpTs + TWENTY_FOUR_HOURS_MS) {
+        activeOutNow = embeddedPrev;
+      } else if (episodesList.length > 0) {
+        activeOutNow = episodesList.find((ep) => {
+          const t = getTvMazeEpisodeTimestamp(ep);
+          return t !== null && now >= t && now < t + TWENTY_FOUR_HOURS_MS;
         });
+      }
 
-        if (upcomingEp) {
-          showInfo.nextEpisode = upcomingEp;
+      if (activeOutNow) {
+        showInfo.outNowEpisode = activeOutNow;
+        showInfo.previousEpisode = activeOutNow;
+      } else if (embeddedPrev) {
+        showInfo.previousEpisode = embeddedPrev;
+      }
+
+      // 3. Identify the true upcoming future episode (strictly where epTs > now)
+      if (embeddedNext && nextEpTs !== null && nextEpTs > now) {
+        showInfo.nextEpisode = embeddedNext;
+      } else if (episodesList.length > 0) {
+        const trueFutureEp = episodesList.find((ep) => {
+          const t = getTvMazeEpisodeTimestamp(ep);
+          return t !== null && t > now;
+        });
+        if (trueFutureEp) {
+          showInfo.nextEpisode = trueFutureEp;
         }
       }
     }

@@ -33,6 +33,23 @@ export const db = getFirestore(app, firebaseConfig.firestoreDatabaseId);
 export const storage = getStorage(app);
 export { doc, setDoc, onSnapshot, serverTimestamp, collection };
 
+// Connection test helper per Firestore guidelines
+async function testConnection() {
+  try {
+    await getDocFromServer(doc(db, 'test', 'connection'));
+  } catch (error: any) {
+    const msg = error instanceof Error ? error.message : String(error);
+    if (
+      msg.includes('the client is offline') ||
+      msg.includes('unavailable') ||
+      msg.includes('Could not reach Cloud Firestore')
+    ) {
+      console.warn('Firestore is operating in offline mode.');
+    }
+  }
+}
+testConnection().catch(() => {});
+
 export const SCOPES = ['https://www.googleapis.com/auth/spreadsheets'];
 
 const provider = new GoogleAuthProvider();

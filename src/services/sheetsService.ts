@@ -71,6 +71,12 @@ export function parseGoogleSheetsDate(val: any): string {
   }
   
   const str = String(val).trim();
+  
+  // 1. Detect and preserve ISO airstamps (e.g. 2026-10-06T01:00:00+00:00)
+  if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/.test(str)) {
+    return str;
+  }
+
   const rawNum = Number(str);
   if (!isNaN(rawNum) && rawNum > 30000 && rawNum < 60000) {
     const baseDate = new Date(1899, 11, 30);
@@ -160,6 +166,7 @@ export const DEFAULT_WISHLIST_HEADERS = [
   'Poster',       // Col H (7)
   'Release Date', // Col I (8)
   'Release Note', // Col J (9)
+  'Who',          // Col K (10)
 ];
 
 export function extractImageUrl(val: string | undefined): string | undefined {
@@ -193,6 +200,22 @@ export function formatPosterForSheet(url: string | undefined): string {
 
 export function matchHeaderToField(header: string, index: number): string {
   const h = header.trim().toLowerCase();
+
+  // Explicit title / name / show header check
+  if (
+    h.includes('title') ||
+    h.includes('show name') ||
+    h.includes('series name') ||
+    h.includes('movie name') ||
+    h.includes('film name') ||
+    h === 'title' ||
+    h === 'name' ||
+    h === 'show' ||
+    h === 'movie' ||
+    h === 'series'
+  ) {
+    return 'title';
+  }
 
   // If header is empty, fallback by column index position
   if (!h) {
@@ -564,70 +587,162 @@ export function findMatchingShowcaseSheet(sheetNames: string[]): string | undefi
   });
 }
 
+export interface BatchFetchResult {
+  sheetResults: Record<string, SheetParseResult>;
+  viewersResult?: FetchViewersResult;
+  dataSignature?: string;
+}
+
+export function computeSheetDataSignature(valueRanges: any[]): string {
+  if (!Array.isArray(valueRanges)) return '';
+  let hash = 0x811c9dc5;
+  let totalCells = 0;
+  let rowCount = 0;
+
+  for (const vr of valueRanges) {
+    const values = vr?.values;
+    if (Array.isArray(values)) {
+      rowCount += values.length;
+      for (let r = 0; r < values.length; r++) {
+        const row = values[r];
+        if (Array.isArray(row)) {
+          totalCells += row.length;
+          for (let c = 0; c < row.length; c++) {
+            const str = String(row[c] ?? '');
+            for (let i = 0; i < str.length; i++) {
+              hash ^= str.charCodeAt(i);
+              hash = Math.imul(hash, 0x01000193);
+            }
+          }
+        }
+      }
+    }
+  }
+
+  return `sig_r${rowCount}_c${totalCells}_h${(hash >>> 0).toString(16)}`;
+}
+
+export async function fetchAllSheetDataBatch(
+  spreadsheetId: string,
+  tabConfigs: Array<{ name: string; isWishlist: boolean }>,
+  accessToken: string,
+  listsTabName?: string
+): Promise<BatchFetchResult> {
+  if (tabConfigs.length === 0 && !listsTabName) return { sheetResults: {} };
+
+  let resolvedConfigs = tabConfigs;
+  try {
+    const meta = await fetchSpreadsheetDetails(spreadsheetId, accessToken);
+    resolvedConfigs = tabConfigs.map((t) => {
+      if (t.isWishlist || t.name.toLowerCase().includes('wishlist')) {
+        const matched = findMatchingWishlistSheet(meta.sheetNames);
+        if (matched) {
+          return { ...t, name: matched };
+        }
+      } else {
+        const matchedMaster = findMatchingMasterSheet(meta.sheetNames);
+        if (matchedMaster) {
+          return { ...t, name: matchedMaster };
+        }
+      }
+      return t;
+    });
+  } catch (e) {
+    console.warn('Batch tab name resolution notice:', e);
+  }
+
+  const allRanges: string[] = [];
+  const rangeMap: Array<{ type: 'tab' | 'lists'; name: string; isWishlist?: boolean }> = [];
+
+  resolvedConfigs.forEach((t) => {
+    allRanges.push(encodeURIComponent(formatA1Range(t.name, 'A1:ZZ1000')));
+    rangeMap.push({ type: 'tab', name: t.name, isWishlist: t.isWishlist });
+  });
+
+  if (listsTabName) {
+    allRanges.push(encodeURIComponent(formatA1Range(listsTabName, 'D2:E900')));
+    rangeMap.push({ type: 'lists', name: listsTabName });
+  }
+
+  const url = `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values:batchGet?ranges=${allRanges.join('&ranges=')}&valueRenderOption=FORMULA`;
+
+  const res = await fetch(url, {
+    headers: { Authorization: `Bearer ${accessToken}` },
+  });
+
+  if (!res.ok) {
+    // If batch fails, fallback to individual fetches for resilience
+    const sheetResults: Record<string, SheetParseResult> = {};
+    for (const config of tabConfigs) {
+      try {
+        sheetResults[config.name] = await fetchSheetRows(spreadsheetId, config.name, accessToken, config.isWishlist);
+      } catch (e) {
+        console.warn(`Fallback fetch failed for ${config.name}:`, e);
+      }
+    }
+    let viewersResult: FetchViewersResult | undefined = undefined;
+    if (listsTabName) {
+      try {
+        viewersResult = await fetchCustomViewers(spreadsheetId, listsTabName, accessToken);
+      } catch {}
+    }
+    return { sheetResults, viewersResult };
+  }
+
+  const data = await res.json();
+  const valueRanges = data.valueRanges || [];
+  const sheetResults: Record<string, SheetParseResult> = {};
+  let viewersResult: FetchViewersResult | undefined = undefined;
+
+  rangeMap.forEach((item, idx) => {
+    const vr = valueRanges[idx];
+    const rawRows: string[][] = vr?.values || [];
+    if (item.type === 'tab') {
+      sheetResults[item.name] = parseRawSheetRows(item.name, rawRows, Boolean(item.isWishlist));
+    } else if (item.type === 'lists') {
+      const viewers: string[] = [];
+      const colors: Record<string, string> = {};
+      rawRows.forEach((row: any) => {
+        if (!Array.isArray(row) || !row[0]) return;
+        const name = String(row[0]).trim();
+        const lower = name.toLowerCase();
+        if (
+          name.length > 0 &&
+          lower !== 'who' &&
+          lower !== 'viewer' &&
+          lower !== 'viewers' &&
+          lower !== 'name' &&
+          lower !== 'profile' &&
+          lower !== 'profiles' &&
+          lower !== 'color' &&
+          lower !== 'color tag' &&
+          lower !== 'color tags'
+        ) {
+          if (!viewers.includes(name)) {
+            viewers.push(name);
+          }
+          if (row[1]) {
+            const color = String(row[1]).trim();
+            if (color) colors[name] = color;
+          }
+        }
+      });
+      viewersResult = { viewers, colors };
+    }
+  });
+
+  const dataSignature = computeSheetDataSignature(valueRanges);
+
+  return { sheetResults, viewersResult, dataSignature };
+}
+
 export async function fetchMultipleSheetRows(
   spreadsheetId: string,
   tabConfigs: Array<{ name: string; isWishlist: boolean }>,
   accessToken: string
 ): Promise<Record<string, SheetParseResult>> {
-  if (tabConfigs.length === 0) return {};
-
-  const ranges = tabConfigs.map(t => encodeURIComponent(formatA1Range(t.name, 'A1:ZZ1000'))).join('&ranges=');
-  const url = `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values:batchGet?ranges=${ranges}&valueRenderOption=FORMULA`;
-
-  const res = await fetch(url, {
-    headers: { Authorization: `Bearer ${accessToken}` }
-  });
-
-  if (!res.ok) {
-    // If batch fails, fallback to individual fetches for better resilience
-    const results: Record<string, SheetParseResult> = {};
-    for (const config of tabConfigs) {
-      try {
-        results[config.name] = await fetchSheetRows(spreadsheetId, config.name, accessToken, config.isWishlist);
-      } catch (e) {
-        console.warn(`Fallback fetch failed for ${config.name}:`, e);
-      }
-    }
-    return results;
-  }
-
-  const data = await res.json();
-  const valueRanges = data.valueRanges || [];
-  const finalResults: Record<string, SheetParseResult> = {};
-
-  tabConfigs.forEach((config, idx) => {
-    const vr = valueRanges[idx];
-    const rawRows: string[][] = vr?.values || [];
-    
-    // Logic from fetchSheetRows adapted for raw rows
-    if (rawRows.length === 0) {
-      finalResults[config.name] = { shows: [], headers: [], headerRowIndex: 0 };
-      return;
-    }
-
-    let headerIndex = -1;
-    for (let i = 0; i < Math.min(10, rawRows.length); i++) {
-      const row = rawRows[i];
-      if (row && row.some((col) => String(col).trim().toLowerCase() === 'title')) {
-        headerIndex = i;
-        break;
-      }
-    }
-    if (headerIndex === -1) headerIndex = 0;
-
-    const headers = rawRows[headerIndex]
-      .map((h) => String(h).trim())
-      .map((h, i) => (h === '' && i > 15 ? '' : h));
-
-    // We can't easily replicate the entire complex parsing logic here without duplication, 
-    // but we can wrap the raw data and use a helper or just call the parser.
-    // For now, let's keep it simple and process the rows.
-    
-    // Actually, I'll create a parseRawSheetRows helper in sheetsService to avoid duplication.
-    finalResults[config.name] = parseRawSheetRows(config.name, rawRows, config.isWishlist);
-  });
-
-  return finalResults;
+  const result = await fetchAllSheetDataBatch(spreadsheetId, tabConfigs, accessToken);
+  return result.sheetResults;
 }
 
 export function parseRawSheetRows(
@@ -639,24 +754,32 @@ export function parseRawSheetRows(
     return { shows: [], headers: [], headerRowIndex: 0 };
   }
 
-  // Find header row (the row containing 'Title' or 'title')
+  // Find header row within Rows 1-10 (0-based indices 0..9)
   let headerIndex = -1;
   for (let i = 0; i < Math.min(10, rawRows.length); i++) {
     const row = rawRows[i];
-    if (row && row.some((col) => String(col).trim().toLowerCase() === 'title')) {
+    if (!row || row.length === 0) continue;
+    if (row.some((col) => {
+      const c = String(col).trim().toLowerCase();
+      return (
+        c === 'title' || c.includes('title') || c === 'type' || c === 'platform' ||
+        c === 'genre' || c === 'priority' || c === 'season' || c === 'episodes' ||
+        c === 'name' || c === 'show' || c === 'status'
+      );
+    })) {
       headerIndex = i;
       break;
     }
   }
 
-  // Default to row 0 if no explicit 'Title' column found
+  // Default to Row 1 (0-based index 0) if none found
   if (headerIndex === -1) {
     headerIndex = 0;
   }
 
-  const headers = rawRows[headerIndex]
+  const headers = (rawRows[headerIndex] || [])
     .map((h) => String(h).trim())
-    .map((h, i) => (h === '' && i > 15 ? '' : h)); // ignore erroneous trailing empty columns
+    .map((h, i) => (h === '' && i > 15 ? '' : h));
 
   // Map header fields using matchHeaderToField
   let titleIdx = -1;
@@ -708,29 +831,96 @@ export function parseRawSheetRows(
     else if (field === 'release_note' && releaseNoteIdx === -1) releaseNoteIdx = idx;
   });
 
+  // If titleIdx was not explicitly matched by header text, find the first non-ID column or fallback to 0
+  if (titleIdx === -1) {
+    for (let c = 0; c < Math.max(headers.length, 1); c++) {
+      const h = (headers[c] || '').toLowerCase().trim();
+      if (h !== 'id' && h !== '#' && h !== 'no' && h !== 'num' && h !== 'row' && h !== 'index') {
+        titleIdx = c;
+        break;
+      }
+    }
+    if (titleIdx === -1) titleIdx = 0;
+  }
+
   const isEffectiveWishlist =
     isWishlistTab ||
     sheetName.toLowerCase().includes('wishlist');
 
-  // Safe fallbacks by standard position ONLY if NOT a Wishlist tab:
-  if (!isEffectiveWishlist) {
-    if (seasonsIdx === -1 && headers.length > 3 && yearIdx !== 3) seasonsIdx = 3;
-    if (episodesIdx === -1 && headers.length > 4 && priorityIdx !== 4) episodesIdx = 4;
-    if (posterIdx === -1 && headers.length > 15) posterIdx = 15;
-    if (releaseDateIdx === -1 && headers.length > 16) releaseDateIdx = 16;
-    if (releaseNoteIdx === -1 && headers.length > 17) releaseNoteIdx = 17;
+  const isEffectiveShowcase = sheetName.toLowerCase().includes('showcase');
+
+  // Positional fallbacks if any fields are unmapped
+  if (isEffectiveWishlist) {
+    if (typeIdx === -1) typeIdx = 1;
+    if (platformIdx === -1) platformIdx = 2;
+    if (yearIdx === -1) yearIdx = 3;
+    if (priorityIdx === -1) priorityIdx = 4;
+    if (dateAddedIdx === -1) dateAddedIdx = 5;
+    if (doneIdx === -1) doneIdx = 6;
+    if (posterIdx === -1) posterIdx = 7;
+    if (releaseDateIdx === -1) releaseDateIdx = 8;
+    if (releaseNoteIdx === -1) releaseNoteIdx = 9;
+    if (whoIdx === -1) whoIdx = 10;
+  } else if (isEffectiveShowcase) {
+    if (typeIdx === -1) typeIdx = 1;
+    if (platformIdx === -1) platformIdx = 2;
+    if (genreIdx === -1) genreIdx = 3;
+    if (posterIdx === -1) posterIdx = 4;
+    if (notesIdx === -1) notesIdx = 5;
+  } else {
+    // Master Tracker
+    if (typeIdx === -1) typeIdx = 1;
+    if (platformIdx === -1) platformIdx = 2;
+    if (seasonsIdx === -1) seasonsIdx = 3;
+    if (episodesIdx === -1) episodesIdx = 4;
+    if (nextEpIdx === -1) nextEpIdx = 5;
+    if (nextSsnIdx === -1) nextSsnIdx = 6;
+    if (genreIdx === -1) genreIdx = 7;
+    if (yearIdx === -1) yearIdx = 8;
+    if (statusIdx === -1) statusIdx = 9;
+    if (ratingTextIdx === -1) ratingTextIdx = 10;
+    if (notesIdx === -1) notesIdx = 11;
+    if (whoIdx === -1) whoIdx = 12;
+    if (ratingIdx === -1) ratingIdx = 13;
+    if (maxEpIdx === -1) maxEpIdx = 14;
+    if (posterIdx === -1) posterIdx = 15;
+    if (releaseDateIdx === -1) releaseDateIdx = 16;
+    if (releaseNoteIdx === -1) releaseNoteIdx = 17;
   }
-  if (titleIdx === -1 && headers.length > 0) titleIdx = 0;
 
   const shows: ShowItem[] = [];
 
+  // Read data rows starting immediately after header row
   for (let r = headerIndex + 1; r < rawRows.length; r++) {
     const row = rawRows[r];
     if (!row || row.length === 0) continue;
 
-    const title = titleIdx !== -1 && row[titleIdx] ? String(row[titleIdx]).trim() : '';
-    if (!title) continue; // skip blank rows
+    let rawTitle = row[titleIdx] !== undefined ? String(row[titleIdx]).trim() : '';
 
+    // If rawTitle is empty or looks like a row number (e.g. "1") and Col A was just an ID/index, try Col B
+    if ((!rawTitle || (titleIdx === 0 && /^\d+$/.test(rawTitle))) && row[1] && typeof row[1] === 'string') {
+      const alt = String(row[1]).trim();
+      if (alt && !/^\d+$/.test(alt)) {
+        rawTitle = alt;
+      }
+    }
+
+    if (!rawTitle) continue;
+
+    // Skip if row is a duplicate header row
+    const lowerTitle = rawTitle.toLowerCase();
+    if (
+      lowerTitle === 'title' ||
+      lowerTitle === 'show name' ||
+      lowerTitle === 'series name' ||
+      lowerTitle === 'movie name' ||
+      lowerTitle === 'name' ||
+      lowerTitle === 'show'
+    ) {
+      continue;
+    }
+
+    const title = rawTitle;
     const typeStr = typeIdx !== -1 && row[typeIdx] ? String(row[typeIdx]).trim() : 'Series';
     const type = typeStr.toLowerCase().includes('movie') ? 'Movie' : 'Series';
     const isMovie = type === 'Movie';
@@ -892,277 +1082,7 @@ export async function fetchSheetRows(
 
   const data = await res.json();
   const rawRows: string[][] = data.values || [];
-
-  if (rawRows.length === 0) {
-    return { shows: [], headers: [], headerRowIndex: 0 };
-  }
-
-  // Find header row (the row containing 'Title' or 'title')
-  let headerIndex = -1;
-  for (let i = 0; i < Math.min(10, rawRows.length); i++) {
-    const row = rawRows[i];
-    if (row && row.some((col) => String(col).trim().toLowerCase() === 'title')) {
-      headerIndex = i;
-      break;
-    }
-  }
-
-  // Default to row 0 if no explicit 'Title' column found
-  if (headerIndex === -1) {
-    headerIndex = 0;
-  }
-
-  // If headerIndex > 0 (e.g., row 4), clean up any stray "Poster" left in row 1 (P1)
-  if (headerIndex > 0) {
-    const p1Val = rawRows[0]?.[15] ? String(rawRows[0][15]).trim() : '';
-    if (p1Val.toLowerCase() === 'poster') {
-      clearRow1Poster(spreadsheetId, targetSheet, accessToken).catch(() => {});
-    }
-  }
-
-  const headers = rawRows[headerIndex]
-    .map((h) => String(h).trim())
-    .map((h, i) => (h === '' && i > 15 ? '' : h)); // ignore erroneous trailing empty columns
-  console.log(`[Google Sheets Fetch] Sheet: "${targetSheet}", detected headers:`, headers);
-
-  // Map header fields using matchHeaderToField
-  let titleIdx = -1;
-  let typeIdx = -1;
-  let platformIdx = -1;
-  let seasonsIdx = -1;
-  let episodesIdx = -1;
-  let nextEpIdx = -1;
-  let nextSsnIdx = -1;
-  let genreIdx = -1;
-  let yearIdx = -1;
-  let priorityIdx = -1;
-  let dateAddedIdx = -1;
-  let doneIdx = -1;
-  let statusIdx = -1;
-  let ratingIdx = -1;
-  let ratingTextIdx = -1;
-  let notesIdx = -1;
-  let whoIdx = -1;
-  let maxEpIdx = -1;
-  let posterIdx = -1;
-  let backdropIdx = -1;
-  let releaseDateIdx = -1;
-  let releaseNoteIdx = -1;
-
-  headers.forEach((h, idx) => {
-    const field = matchHeaderToField(h, idx);
-    console.log(`[Google Sheets Mapping] Header: "${h}", Field: "${field}", Index: ${idx}`);
-    if (field === 'title' && titleIdx === -1) titleIdx = idx;
-    else if (field === 'type' && typeIdx === -1) typeIdx = idx;
-    else if (field === 'platform' && platformIdx === -1) platformIdx = idx;
-    else if (field === 'season' && seasonsIdx === -1) seasonsIdx = idx;
-    else if (field === 'episode' && episodesIdx === -1) episodesIdx = idx;
-    else if (field === 'next_ep' && nextEpIdx === -1) nextEpIdx = idx;
-    else if (field === 'next_ssn' && nextSsnIdx === -1) nextSsnIdx = idx;
-    else if (field === 'genre' && genreIdx === -1) genreIdx = idx;
-    else if (field === 'year' && yearIdx === -1) yearIdx = idx;
-    else if (field === 'priority' && priorityIdx === -1) priorityIdx = idx;
-    else if (field === 'date_added' && dateAddedIdx === -1) dateAddedIdx = idx;
-    else if (field === 'done' && doneIdx === -1) doneIdx = idx;
-    else if (field === 'status' && statusIdx === -1) statusIdx = idx;
-    else if (field === 'rating_num' && ratingIdx === -1) ratingIdx = idx;
-    else if (field === 'rating' && ratingTextIdx === -1) ratingTextIdx = idx;
-    else if (field === 'notes' && notesIdx === -1) notesIdx = idx;
-    else if (field === 'who' && whoIdx === -1) whoIdx = idx;
-    else if (field === 'max_ep' && maxEpIdx === -1) maxEpIdx = idx;
-    else if (field === 'poster' && posterIdx === -1) posterIdx = idx;
-    else if (field === 'backdrop' && backdropIdx === -1) backdropIdx = idx;
-    else if (field === 'release_date' && releaseDateIdx === -1) releaseDateIdx = idx;
-    else if (field === 'release_note' && releaseNoteIdx === -1) releaseNoteIdx = idx;
-  });
-
-  console.log(`[Google Sheets Fetch] Sheet: "${targetSheet}", mapped poster column index: ${posterIdx} (header: "${posterIdx !== -1 ? headers[posterIdx] : 'None'}"), title column index: ${titleIdx}`);
-
-  const isEffectiveWishlist =
-    isWishlistTab ||
-    sheetName.toLowerCase().includes('wishlist');
-
-  // Safe fallbacks by standard position ONLY if NOT a Wishlist tab:
-  if (!isEffectiveWishlist) {
-    if (seasonsIdx === -1 && headers.length > 3 && yearIdx !== 3) seasonsIdx = 3;
-    if (episodesIdx === -1 && headers.length > 4 && priorityIdx !== 4) episodesIdx = 4;
-    if (posterIdx === -1 && headers.length > 15) posterIdx = 15;
-    if (releaseDateIdx === -1 && headers.length > 16) releaseDateIdx = 16;
-    if (releaseNoteIdx === -1 && headers.length > 17) releaseNoteIdx = 17;
-  }
-  if (titleIdx === -1 && headers.length > 0) titleIdx = 0;
-
-  const shows: ShowItem[] = [];
-
-  for (let r = headerIndex + 1; r < rawRows.length; r++) {
-    const row = rawRows[r];
-    if (!row || row.length === 0) continue;
-
-    const title = titleIdx !== -1 && row[titleIdx] ? String(row[titleIdx]).trim() : '';
-    if (!title) continue; // skip blank rows
-
-    const typeStr = typeIdx !== -1 && row[typeIdx] ? String(row[typeIdx]).trim() : 'Series';
-    const type = typeStr.toLowerCase().includes('movie') ? 'Movie' : 'Series';
-    const isMovie = type === 'Movie';
-    const rawPlatform = platformIdx !== -1 && row[platformIdx] ? String(row[platformIdx]).trim() : '';
-    const platform = normalizePlatform(rawPlatform);
-    const seasons = isMovie ? '' : (seasonsIdx !== -1 && row[seasonsIdx] ? String(row[seasonsIdx]).trim() : 'S1');
-    const episodes = isMovie ? '' : (episodesIdx !== -1 && row[episodesIdx] ? String(row[episodesIdx]).trim() : 'E1');
-    const nextEpRaw = nextEpIdx !== -1 ? row[nextEpIdx] : '';
-    const nextEp = isMovie ? false : (String(nextEpRaw).trim().toUpperCase() === 'TRUE' || String(nextEpRaw).trim() === '1');
-    const nextSsnRaw = nextSsnIdx !== -1 ? row[nextSsnIdx] : '';
-    const nextSsn = isMovie ? false : (String(nextSsnRaw).trim().toUpperCase() === 'TRUE' || String(nextSsnRaw).trim() === '1');
-    const genre = genreIdx !== -1 && row[genreIdx] ? String(row[genreIdx]).trim() : 'Drama';
-    const year = yearIdx !== -1 && row[yearIdx] ? String(row[yearIdx]).trim() : '2024';
-
-    const priority = priorityIdx !== -1 && row[priorityIdx] ? normalizePriority(String(row[priorityIdx])) : (isEffectiveWishlist ? '🔴 High' : undefined);
-    const dateAddedRaw = dateAddedIdx !== -1 && row[dateAddedIdx] ? String(row[dateAddedIdx]).trim() : undefined;
-    const dateAdded = dateAddedRaw ? parseGoogleSheetsDate(dateAddedRaw) : undefined;
-    const doneVal = doneIdx !== -1 && row[doneIdx] ? String(row[doneIdx]).trim().toUpperCase() : '';
-
-    let statusRaw = statusIdx !== -1 && row[statusIdx] ? String(row[statusIdx]).trim() : '⏳ Watching';
-    let status: WatchStatus = '⏳ Watching';
-    if (doneVal === 'TRUE' || doneVal === 'DONE' || doneVal === 'YES' || doneVal === '1') {
-      status = '✅ Watched';
-    } else if (statusRaw.includes('Watched') || statusRaw.includes('Done') || statusRaw.includes('Finished')) {
-      status = '✅ Watched';
-    } else if (statusRaw.includes('Drop') || statusRaw.includes('❌')) {
-      status = '❌ Dropped';
-    } else if (statusRaw.includes('Hold') || statusRaw.includes('Pause') || statusRaw.includes('⏸️')) {
-      status = '⏸️ Paused';
-    } else {
-      status = '⏳ Watching';
-    }
-
-    const ratingRaw = ratingTextIdx !== -1 && row[ratingTextIdx] ? String(row[ratingTextIdx]).trim() : '';
-    let ratingNum = 0;
-    if (ratingIdx !== -1 && row[ratingIdx]) {
-      const rawVal = String(row[ratingIdx]).trim();
-      // Handle cases like "5/5" or "4/5" in the numeric column
-      const firstPart = rawVal.split('/')[0];
-      const parsed = parseFloat(firstPart.replace(/[^0-9.]/g, ''));
-      if (!isNaN(parsed)) {
-        ratingNum = parsed;
-      }
-    }
-    // Cap ratingNum to maximum 5, or if it's a multi-digit number like 45 (from 4/5 fallback), scale it down
-    if (ratingNum > 5) {
-      if (ratingNum >= 10 && ratingNum <= 55) {
-        ratingNum = Math.min(5, Math.floor(ratingNum / 10));
-      } else {
-        ratingNum = 5;
-      }
-    }
-    if (ratingNum === 0 && ratingRaw) {
-      const stars = (ratingRaw.match(/⭐/g) || []).length;
-      if (stars > 0) ratingNum = stars;
-    }
-
-    const notes = notesIdx !== -1 && row[notesIdx] ? String(row[notesIdx]).trim() : '';
-    const who = whoIdx !== -1 && row[whoIdx] ? String(row[whoIdx]).trim() : '';
-    const maxEp = isMovie ? '' : (maxEpIdx !== -1 && row[maxEpIdx] ? String(row[maxEpIdx]).trim() : 'E8');
-    const releaseDateRaw = releaseDateIdx !== -1 && row[releaseDateIdx] ? String(row[releaseDateIdx]).trim() : undefined;
-    const releaseDate = releaseDateRaw ? parseGoogleSheetsDate(releaseDateRaw) : undefined;
-    const releaseNote = releaseNoteIdx !== -1 && row[releaseNoteIdx] ? String(row[releaseNoteIdx]).trim() : undefined;
-
-    // Poster resolution across all possible column sources
-    let rawPosterCell = '';
-    let customPoster: string | undefined = undefined;
-
-    if (posterIdx !== -1 && row[posterIdx]) {
-      rawPosterCell = String(row[posterIdx]).trim();
-      customPoster = extractImageUrl(rawPosterCell);
-    }
-    // Wishlist standard Col H (index 7)
-    if (!customPoster && isEffectiveWishlist && row.length > 7 && row[7]) {
-      rawPosterCell = String(row[7]).trim();
-      customPoster = extractImageUrl(rawPosterCell);
-    }
-    // Master Tracker standard Col P (index 15)
-    if (!customPoster && !isEffectiveWishlist && row.length > 15 && row[15]) {
-      rawPosterCell = String(row[15]).trim();
-      customPoster = extractImageUrl(rawPosterCell);
-    }
-    // Fallback: search all other row cells for any image formula or URL
-    if (!customPoster) {
-      for (let c = 0; c < row.length; c++) {
-        const cell = String(row[c] || '').trim();
-        if (
-          cell.includes('=IMAGE') ||
-          cell.includes('=image') ||
-          cell.includes('http://') ||
-          cell.includes('https://') ||
-          cell.includes('drive.google.com')
-        ) {
-          const parsed = extractImageUrl(cell);
-          if (parsed) {
-            rawPosterCell = cell;
-            customPoster = parsed;
-            break;
-          }
-        }
-      }
-    }
-
-    const customBackdrop = backdropIdx !== -1 && row[backdropIdx] ? extractImageUrl(String(row[backdropIdx])) : undefined;
-
-    // Debugging verification log for poster extraction
-    if (title.toLowerCase().includes('reacher') || customPoster || rawPosterCell) {
-      console.log(`[Google Sheets Fetch] Show "${title}" (Row ${r + 1}): raw poster cell = "${rawPosterCell}", extracted posterUrl = "${customPoster || 'none'}"`);
-    }
-
-    // Build unique id
-    const tabPrefix = sheetName.toLowerCase().replace(/[^a-z0-9]/g, '');
-    const id = `show-${tabPrefix}-${r}-${title.toLowerCase().replace(/[^a-z0-9]/g, '-')}`;
-
-    const finalPosterUrl = customPoster || customBackdrop || getPosterForShow(title, genre);
-    const finalBackdropUrl = customBackdrop || customPoster || getBackdropForShow(title, genre);
-
-    let finalRatingText = 'Unrated';
-    if (ratingRaw) {
-      finalRatingText = ratingRaw;
-    } else if (ratingNum > 0) {
-      if (ratingNum === 1) finalRatingText = '⭐ = Poor';
-      else if (ratingNum === 2) finalRatingText = '⭐⭐ = Fair';
-      else if (ratingNum === 3) finalRatingText = '⭐⭐⭐ = Good';
-      else if (ratingNum === 4) finalRatingText = '⭐⭐⭐⭐ = Great';
-      else if (ratingNum === 5) finalRatingText = '⭐⭐⭐⭐⭐ = Excellent';
-    }
-
-    shows.push({
-      id,
-      title,
-      type,
-      platform,
-      seasons,
-      episodes,
-      nextEp,
-      nextSsn,
-      genre,
-      year,
-      status,
-      rating: finalRatingText,
-      ratingNum: ratingNum || 0,
-      notes,
-      who,
-      maxEp,
-      rowNumber: r + 1, // 1-indexed for Sheets API
-      isWishlist: isEffectiveWishlist,
-      sheetTabName: sheetName,
-      priority,
-      dateAdded,
-      backdropUrl: finalBackdropUrl,
-      posterUrl: finalPosterUrl,
-      releaseDate,
-      releaseNote,
-    });
-  }
-
-  return {
-    shows,
-    headers,
-    headerRowIndex: headerIndex,
-  };
+  return parseRawSheetRows(targetSheet, rawRows, isWishlistTab);
 }
 
 export interface FetchViewersResult {
@@ -1363,6 +1283,9 @@ export function buildRowValues(show: ShowItem, headers: string[]): string[] {
         case 'release_note':
           values.push(show.releaseNote || '');
           break;
+        case 'who':
+          values.push(show.who || '');
+          break;
         default:
           values.push('');
       }
@@ -1539,6 +1462,11 @@ export async function updateSheetRow(
   headers: string[],
   accessToken: string
 ): Promise<void> {
+  // Safety protection: Never touch Rows 1–3 (headers/labels)
+  if (rowNumber < 4) {
+    console.warn(`Safety abort: Cannot update protected header/label row ${rowNumber}. Data starts at Row 4.`);
+    return;
+  }
   const isWishlist =
     Boolean(show.isWishlist) || sheetName.toLowerCase().includes('wishlist');
   let activeHeaders =
@@ -1606,6 +1534,11 @@ export async function updateEpisodeAndSeasonInSheet(
   releaseDate?: string,
   releaseNote?: string
 ): Promise<void> {
+  // Safety protection: Never touch Rows 1–3 (headers/labels)
+  if (rowNumber < 4) {
+    console.warn(`Safety abort: Cannot update protected header/label row ${rowNumber}. Data starts at Row 4.`);
+    return;
+  }
   const isMovie = type === 'Movie' || (seasons === '' && episodes === '' && maxEp === '');
   const activeHeaders = headers && headers.length > 0 ? headers : DEFAULT_TRACKER_HEADERS;
 
@@ -1779,12 +1712,22 @@ export async function appendSheetRow(
     Boolean(show.isWishlist) ||
     sheetName.toLowerCase().includes('wishlist');
 
-  let targetHeaders = isWishlist ? DEFAULT_WISHLIST_HEADERS : headers;
-  let nextRow = 2;
+  // Check if title already exists in the sheet to prevent duplicates
+  if (show.title) {
+    const existingRow = await findRowNumberByTitle(spreadsheetId, sheetName, show.title, accessToken);
+    if (existingRow && existingRow >= 4) {
+      console.log(`[appendSheetRow] "${show.title}" already exists at row ${existingRow} in "${sheetName}". Updating row instead of appending duplicate.`);
+      await updateSheetRow(spreadsheetId, sheetName, existingRow, show, headers, accessToken);
+      return { rowNumber: existingRow };
+    }
+  }
 
-  // Inspect the live tab to identify the header row and exact next empty row
+  let targetHeaders = isWishlist ? DEFAULT_WISHLIST_HEADERS : headers;
+  let nextRow = 4; // Rows 1–3 are headers/labels. Data starts at Row 4 downwards.
+
+  // Inspect the live tab to identify the last used row starting from Row 4
   try {
-    const checkRange = formatA1Range(sheetName, 'A1:Z500');
+    const checkRange = formatA1Range(sheetName, 'A1:ZZ1000');
     const checkRes = await fetch(
       `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/${encodeURIComponent(checkRange)}`,
       { headers: { Authorization: `Bearer ${accessToken}` } }
@@ -1793,11 +1736,9 @@ export async function appendSheetRow(
       const data = await checkRes.json();
       const rows: string[][] = data.values || [];
 
-      // Find the row containing 'Title'
-      let headerIdx = -1;
-      for (let i = 0; i < Math.min(10, rows.length); i++) {
+      // Find headers in Rows 1-3 if present
+      for (let i = 0; i < Math.min(3, rows.length); i++) {
         if (rows[i] && rows[i].some((c) => String(c).trim().toLowerCase() === 'title')) {
-          headerIdx = i;
           if (!isWishlist) {
             targetHeaders = rows[i].map((c) => String(c).trim());
           }
@@ -1805,21 +1746,19 @@ export async function appendSheetRow(
         }
       }
 
-      if (headerIdx !== -1) {
-        let lastFilledRow = headerIdx + 1; // 1-based index
-        for (let r = headerIdx + 1; r < rows.length; r++) {
-          const row = rows[r];
-          if (row && row.some((cell) => String(cell).trim() !== '')) {
-            lastFilledRow = r + 1;
-          }
-        }
-        nextRow = lastFilledRow + 1;
-      } else if (rows.length > 0) {
-        nextRow = rows.length + 1;
-        if (!isWishlist) {
-          targetHeaders = rows[0].map((c) => String(c).trim());
+      // Find last used data row starting strictly from Row 4 (0-based index 3)
+      let lastUsedDataRow = 3; // 1-based Row 3 represents the header boundary
+      for (let r = 3; r < rows.length; r++) {
+        const row = rows[r];
+        if (row && row.some((cell) => String(cell).trim() !== '')) {
+          lastUsedDataRow = r + 1; // 1-based row number
         }
       }
+
+      // If Row 4 is empty, lastUsedDataRow is 3 -> nextRow is 4.
+      // If Row 4 has data, lastUsedDataRow is 4 -> nextRow is 5.
+      // If Rows 4, 5, 6 have data, lastUsedDataRow is 6 -> nextRow is 7.
+      nextRow = Math.max(4, lastUsedDataRow + 1);
     }
   } catch (e) {
     console.warn('Tab inspection notice before append:', e);
@@ -1836,7 +1775,7 @@ export async function appendSheetRow(
 
   const rowValues = buildRowValues(show, isWishlist ? DEFAULT_WISHLIST_HEADERS : targetHeaders);
   const posterIdx = targetHeaders.findIndex((h, i) => matchHeaderToField(h, i) === 'poster');
-  const endColLetter = isWishlist ? 'Z' : colIndexToLetter(Math.max(targetHeaders.length - 1, rowValues.length - 1, isWishlist ? 7 : (posterIdx !== -1 ? posterIdx : 4)));
+  const endColLetter = isWishlist ? 'Z' : colIndexToLetter(Math.max(targetHeaders.length - 1, rowValues.length - 1, isWishlist ? 7 : (posterIdx !== -1 ? posterIdx : 15)));
   const finalValues = rowValues;
 
   // 1. Direct write to the exact nextRow via PUT to ensure precision and prevent misplacement
@@ -1861,7 +1800,7 @@ export async function appendSheetRow(
   }
 
   // 2. Fallback to standard Google Sheets :append if PUT was rejected
-  const a1Range = formatA1Range(sheetName, 'A1');
+  const a1Range = formatA1Range(sheetName, 'A4');
   const encodedRange = encodeURIComponent(a1Range);
   const endpoint = `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/${encodedRange}:append?valueInputOption=USER_ENTERED`;
 
@@ -1886,7 +1825,7 @@ export async function appendSheetRow(
   const updatedRange = data.updates?.updatedRange || '';
   const match = updatedRange.match(/![A-Z]+(\d+)/);
   if (match && match[1]) {
-    rowNumber = parseInt(match[1], 10);
+    rowNumber = Math.max(4, parseInt(match[1], 10));
   }
 
   return { rowNumber };
@@ -1899,7 +1838,7 @@ export async function findRowNumberByTitle(
   accessToken: string
 ): Promise<number | null> {
   try {
-    const safeRange = formatA1Range(sheetName, 'A1:Z500');
+    const safeRange = formatA1Range(sheetName, 'A1:ZZ1000');
     const encodedRange = encodeURIComponent(safeRange);
     const res = await fetch(
       `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/${encodedRange}`,
@@ -1913,16 +1852,6 @@ export async function findRowNumberByTitle(
     const data = await res.json();
     const rawRows: string[][] = data.values || [];
 
-    // Find header row (the row containing 'Title' or 'title') to skip it
-    let headerIndex = -1;
-    for (let i = 0; i < Math.min(10, rawRows.length); i++) {
-      const row = rawRows[i];
-      if (row && row.some((col) => String(col).trim().toLowerCase() === 'title')) {
-        headerIndex = i;
-        break;
-      }
-    }
-
     const normalize = (s: string) =>
       s
         .toLowerCase()
@@ -1934,9 +1863,8 @@ export async function findRowNumberByTitle(
     const targetNorm = normalize(title);
     if (!targetNorm) return null;
 
-    // First pass: exact normalized match on Column A (standard title column)
-    for (let r = 0; r < rawRows.length; r++) {
-      if (r === headerIndex) continue; // Skip header row
+    // First pass: exact normalized match on Column A starting strictly from Row 4 (r = 3) downwards
+    for (let r = 3; r < rawRows.length; r++) {
       const row = rawRows[r];
       if (row && row.length > 0) {
         const col0Norm = normalize(String(row[0] || ''));
@@ -1946,8 +1874,8 @@ export async function findRowNumberByTitle(
       }
     }
 
-    // Second pass: exact normalized match across any column
-    for (let r = 0; r < rawRows.length; r++) {
+    // Second pass: exact normalized match across any column starting from Row 4 (r = 3) downwards
+    for (let r = 3; r < rawRows.length; r++) {
       const row = rawRows[r];
       if (row) {
         for (let c = 0; c < row.length; c++) {
@@ -1958,8 +1886,8 @@ export async function findRowNumberByTitle(
       }
     }
 
-    // Third pass: substring match (e.g. title with season notes like "Clarkson's Farm (Season 3)")
-    for (let r = 0; r < rawRows.length; r++) {
+    // Third pass: substring match from Row 4 (r = 3) downwards
+    for (let r = 3; r < rawRows.length; r++) {
       const row = rawRows[r];
       if (row && row.length > 0) {
         const col0Norm = normalize(String(row[0] || ''));
@@ -1981,16 +1909,35 @@ export async function deleteSheetRow(
   sheetTabId: number | undefined,
   accessToken: string
 ): Promise<void> {
+  // Safety protection: Never delete Rows 1–3 (headers/labels)
+  if (rowNumber < 4) {
+    console.warn(`Safety abort: Cannot delete protected header/label row ${rowNumber}.`);
+    return;
+  }
   let numericSheetId = sheetTabId;
+  let resolvedSheetName = sheetName;
 
   if (numericSheetId === undefined) {
     try {
       const meta = await fetchSpreadsheetDetails(spreadsheetId, accessToken);
-      const targetSheet = meta.sheets.find(
+      let targetSheet = meta.sheets.find(
         (s) => s.title.trim().toLowerCase() === sheetName.trim().toLowerCase()
       );
+      if (!targetSheet && sheetName.toLowerCase().includes('wishlist')) {
+        const matchedWishlist = findMatchingWishlistSheet(meta.sheetNames);
+        if (matchedWishlist) {
+          targetSheet = meta.sheets.find((s) => s.title === matchedWishlist);
+        }
+      }
+      if (!targetSheet && (sheetName.toLowerCase().includes('tracker') || sheetName.toLowerCase().includes('master'))) {
+        const matchedMaster = findMatchingMasterSheet(meta.sheetNames);
+        if (matchedMaster) {
+          targetSheet = meta.sheets.find((s) => s.title === matchedMaster);
+        }
+      }
       if (targetSheet) {
         numericSheetId = targetSheet.id;
+        resolvedSheetName = targetSheet.title;
       }
     } catch (e) {
       console.warn('Could not lookup numeric sheetId:', e);
@@ -2035,7 +1982,7 @@ export async function deleteSheetRow(
     }
   } else {
     // Fallback: Clear the row content if numeric sheet tab ID could not be resolved
-    const a1Range = formatA1Range(sheetName, `A${rowNumber}:Z${rowNumber}`);
+    const a1Range = formatA1Range(resolvedSheetName, `A${rowNumber}:Z${rowNumber}`);
     const encodedRange = encodeURIComponent(a1Range);
 
     const res = await fetch(
@@ -2172,7 +2119,7 @@ export async function moveShowBetweenTabs(
     ? DEFAULT_WISHLIST_HEADERS
     : DEFAULT_TRACKER_HEADERS;
 
-  // 1. Ensure target sheet tab exists and resolve actual tab name
+  // 1. Ensure target and source sheet tabs exist and resolve actual tab names
   const targetRes = await ensureSheetTabExists(
     spreadsheetId,
     toSheet,
@@ -2180,6 +2127,22 @@ export async function moveShowBetweenTabs(
     accessToken
   );
   const actualTargetSheet = targetRes.actualTitle || toSheet;
+
+  let actualFromSheet = fromSheet;
+  try {
+    const isSourceWishlist = fromSheet.toLowerCase().includes('wishlist');
+    const sourceRes = await ensureSheetTabExists(
+      spreadsheetId,
+      fromSheet,
+      isSourceWishlist ? DEFAULT_WISHLIST_HEADERS : DEFAULT_TRACKER_HEADERS,
+      accessToken
+    );
+    if (sourceRes.actualTitle) {
+      actualFromSheet = sourceRes.actualTitle;
+    }
+  } catch (e) {
+    console.warn('Could not resolve actual source sheet tab:', e);
+  }
 
   // 2. Fetch target sheet's live headers if possible
   let targetHeaders = isTargetWishlist
@@ -2190,12 +2153,14 @@ export async function moveShowBetweenTabs(
   }
 
   // 3. Append show to target sheet with strict field cleanup
+  const todayStr = new Date().toISOString().split('T')[0];
   const showToAppend: ShowItem = {
     ...show,
     isWishlist: isTargetWishlist,
     sheetTabName: actualTargetSheet,
+    status: (isTargetWishlist ? show.status : '⏳ Watching') as WatchStatus,
+    dateAdded: isTargetWishlist ? (show.dateAdded ? parseGoogleSheetsDate(show.dateAdded) : parseGoogleSheetsDate(undefined)) : todayStr,
     priority: isTargetWishlist ? normalizePriority(show.priority) : undefined,
-    dateAdded: show.dateAdded ? parseGoogleSheetsDate(show.dateAdded) : (isTargetWishlist ? parseGoogleSheetsDate(undefined) : undefined),
     seasons: isTargetWishlist ? '' : normalizeSeasonStr(show.seasons || 'S1'),
     episodes: isTargetWishlist ? '' : normalizeEpisodeStr(show.episodes || 'E1'),
     maxEp: isTargetWishlist ? '' : normalizeEpisodeStr(show.maxEp || 'E8'),
@@ -2231,7 +2196,7 @@ export async function moveShowBetweenTabs(
   // 4. Delete from original sheet (find by title first to ensure accurate index)
   let sourceRow: number | undefined = undefined;
   try {
-    const found = await findRowNumberByTitle(spreadsheetId, fromSheet, show.title, accessToken);
+    const found = await findRowNumberByTitle(spreadsheetId, actualFromSheet, show.title, accessToken);
     if (found) {
       sourceRow = found;
     }
@@ -2244,7 +2209,7 @@ export async function moveShowBetweenTabs(
   }
 
   if (sourceRow) {
-    await deleteSheetRow(spreadsheetId, fromSheet, sourceRow, fromSheetTabId, accessToken).catch((e) => {
+    await deleteSheetRow(spreadsheetId, actualFromSheet, sourceRow, fromSheetTabId, accessToken).catch((e) => {
       console.warn('Failed to delete from source sheet when moving show:', e);
     });
   }

@@ -131,6 +131,95 @@ export function calculateStandardStats(shows: ShowItem[]) {
 }
 
 /**
+ * Normalizes title for duplicate detection and comparison (lower-cased, alphanumeric only, diacritics stripped).
+ */
+export function normalizeTitleForComparison(title: string): string {
+  if (!title) return '';
+  return String(title)
+    .trim()
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-z0-9]/g, '');
+}
+
+/**
+ * Deterministically deduplicates shows without dropping separate sheet rows or Wishlist/Master items.
+ */
+export function deduplicateShowsByTitle(showList: ShowItem[]): ShowItem[] {
+  if (!showList || showList.length === 0) return [];
+
+  const map = new Map<string, ShowItem>();
+
+  for (const show of showList) {
+    if (!show) continue;
+    const normTitle = normalizeTitleForComparison(show.title);
+    if (!normTitle && !show.id) continue;
+
+    const viewerKey = String(show.who || '').trim().toLowerCase();
+    const primaryKey = normTitle ? `title:${normTitle}::${viewerKey}` : `id:${show.id}`;
+
+    const existing = map.get(primaryKey);
+    if (!existing) {
+      map.set(primaryKey, show);
+    } else {
+      const existingRank = Math.max(existing.addedTime || 0, existing.addedRank || 0, existing.sortOrderNum || 0, existing.createdTimestamp || 0);
+      const newRank = Math.max(show.addedTime || 0, show.addedRank || 0, show.sortOrderNum || 0, show.createdTimestamp || 0);
+
+      // Master status safeguard: If one item is Master and the other is Wishlist, favor the Master item or the one updated most recently
+      let isWishlistFinal = existing.isWishlist;
+      if (existing.isWishlist !== show.isWishlist) {
+        if (!existing.isWishlist && show.isWishlist) {
+          isWishlistFinal = newRank > (existingRank + 1000) ? true : false;
+        } else if (existing.isWishlist && !show.isWishlist) {
+          isWishlistFinal = false;
+        }
+      }
+
+      const shouldReplace = newRank >= existingRank;
+
+      if (shouldReplace) {
+        map.set(primaryKey, {
+          ...existing,
+          ...show,
+          isWishlist: isWishlistFinal,
+          posterUrl: show.posterUrl || existing.posterUrl,
+          backdropUrl: show.backdropUrl || existing.backdropUrl,
+          notes: show.notes || existing.notes,
+          releaseDate: show.releaseDate || existing.releaseDate,
+          releaseNote: show.releaseNote || existing.releaseNote,
+          who: show.who || existing.who,
+          genre: show.genre || existing.genre,
+          year: show.year || existing.year,
+          ratingNum: show.ratingNum || existing.ratingNum,
+          rating: show.rating || existing.rating,
+          imdbId: show.imdbId || existing.imdbId,
+        });
+      } else {
+        map.set(primaryKey, {
+          ...show,
+          ...existing,
+          isWishlist: isWishlistFinal,
+          posterUrl: existing.posterUrl || show.posterUrl,
+          backdropUrl: existing.backdropUrl || show.backdropUrl,
+          notes: existing.notes || show.notes,
+          releaseDate: existing.releaseDate || show.releaseDate,
+          releaseNote: existing.releaseNote || show.releaseNote,
+          who: existing.who || existing.who,
+          genre: existing.genre || existing.genre,
+          year: existing.year || existing.year,
+          ratingNum: existing.ratingNum || existing.ratingNum,
+          rating: existing.rating || existing.rating,
+          imdbId: existing.imdbId || existing.imdbId,
+        });
+      }
+    }
+  }
+
+  return Array.from(map.values());
+}
+
+/**
  * Rebuilds pure numeric `addedRank` directly from Sheet data on every load.
  * Clears any stale iOS or browser cache.
  * Higher rowNumber = appended later = higher addedRank = newest = first.
@@ -144,13 +233,19 @@ export function rebuildSheetAddedRanks(showList: ShowItem[]): ShowItem[] {
       : idx + 1;
     // Master tab gets bonus 2, Wishlist gets bonus 1 for deterministic tie-break across tabs
     const tabBonus = show.isWishlist ? 1 : 2;
-    const rank = rowNum * 10 + tabBonus;
+    const computedRank = rowNum * 10 + tabBonus;
+    const finalRank =
+      typeof show.addedRank === 'number' && show.addedRank > computedRank
+        ? show.addedRank
+        : (typeof show.sortOrderNum === 'number' && show.sortOrderNum > computedRank
+          ? show.sortOrderNum
+          : computedRank);
 
     return {
       ...show,
       addedTime: show.addedTime || Date.now(),
-      addedRank: rank,
-      sortOrderNum: rank,
+      addedRank: finalRank,
+      sortOrderNum: finalRank,
     };
   });
 }
@@ -158,20 +253,29 @@ export function rebuildSheetAddedRanks(showList: ShowItem[]): ShowItem[] {
 export const ensureSortOrderNumbers = rebuildSheetAddedRanks;
 
 /**
- * Sort ONLY by addedRank number (highest = newest = first).
- * IGNORE all timestamps/dates — pure numbers = same on ALL browsers (iOS, Preview, Android).
+ * Sort ONLY by highest score (time or addedRank) descending (highest = newest = first).
+ * Ensures newly added or moved titles immediately appear at the top/front.
  */
 export function compareByAddedRank(a: ShowItem, b: ShowItem): number {
   if (a.id === b.id) return 0;
+
+  const timeA = a.createdTimestamp || a.sessionAddedAt || a.addedTime || 0;
+  const timeB = b.createdTimestamp || b.sessionAddedAt || b.addedTime || 0;
+
   const rankA = typeof a.addedRank === 'number' && !isNaN(a.addedRank)
     ? a.addedRank
     : (typeof a.sortOrderNum === 'number' && !isNaN(a.sortOrderNum) ? a.sortOrderNum : 0);
   const rankB = typeof b.addedRank === 'number' && !isNaN(b.addedRank)
     ? b.addedRank
     : (typeof b.sortOrderNum === 'number' && !isNaN(b.sortOrderNum) ? b.sortOrderNum : 0);
-  if (rankA !== rankB) {
-    return rankB - rankA; // HIGHEST = NEWEST = FIRST
+
+  const scoreA = Math.max(timeA, rankA);
+  const scoreB = Math.max(timeB, rankB);
+
+  if (scoreA !== scoreB) {
+    return scoreB - scoreA; // HIGHEST = NEWEST = TOP/FRONT
   }
+
   const rowA = typeof a.rowNumber === 'number' && !isNaN(a.rowNumber) ? a.rowNumber : 0;
   const rowB = typeof b.rowNumber === 'number' && !isNaN(b.rowNumber) ? b.rowNumber : 0;
   if (rowA !== rowB) {
@@ -181,3 +285,14 @@ export function compareByAddedRank(a: ShowItem, b: ShowItem): number {
 }
 
 export const compareRecentlyAdded = compareByAddedRank;
+
+/**
+ * Robust helper to check if a show belongs to Wishlist (by boolean flag, sheet tab name, or status).
+ */
+export function isWishlistShow(s?: ShowItem | null): boolean {
+  if (!s) return false;
+  if (s.isWishlist === true || String(s.isWishlist) === 'true') return true;
+  if (s.sheetTabName && String(s.sheetTabName).toLowerCase().includes('wishlist')) return true;
+  if (s.status && (String(s.status).includes('Wishlist') || String(s.status).includes('🎁'))) return true;
+  return false;
+}

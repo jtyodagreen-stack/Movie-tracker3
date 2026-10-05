@@ -4,8 +4,8 @@ import { ShowItem } from '../types';
 import { getOptimizedPoster } from '../utils/imageOptimizer';
 import { formatToDDMMYYYY } from '../utils/dateUtils';
 import { calculateShowProgress } from '../utils/showMetrics';
-import { isNotificationEnabled, toggleShowNotification, isShowOutNow, isFutureRelease, isReleaseDatePast } from '../services/notificationService';
-import { fetchLiveTvMazeInfo, TvMazeEpisode } from '../services/tvMazeService';
+import { isNotificationEnabled, toggleShowNotification, isShowOutNow, isFutureRelease, isReleaseDatePast, getEffectiveReleaseInfo, parseReleaseDateToTimestamp } from '../services/notificationService';
+import { fetchLiveTvMazeInfo, TvMazeEpisode, TvMazeShowInfo } from '../services/tvMazeService';
 import { getViewerColor } from '../utils/profileColors';
 import { getPriorityIndicator } from '../utils/priorityUtils';
 
@@ -34,6 +34,7 @@ export default function ShowCard({
   const [isNotifActive, setIsNotifActive] = useState(() => isNotificationEnabled(show));
   const [liveAirstamp, setLiveAirstamp] = useState<string | null>(null);
   const [liveNextEpisode, setLiveNextEpisode] = useState<TvMazeEpisode | null>(null);
+  const [tvMazeInfo, setTvMazeInfo] = useState<TvMazeShowInfo | null>(null);
   const touchStartRef = useRef<{ x: number; y: number; time: number } | null>(null);
   const hoverTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const cardRef = useRef<HTMLDivElement>(null);
@@ -51,21 +52,26 @@ export default function ShowCard({
   }, [show.id]);
 
   useEffect(() => {
-    // If show has a future or active releaseDate (within 24h), we don't need liveAirstamp
-    const isPast = isReleaseDatePast(show.releaseDate);
-    if ((show.releaseDate && !isPast) || show.type !== 'Series') {
+    if (show.type !== 'Series') {
       setLiveAirstamp(null);
       setLiveNextEpisode(null);
+      setTvMazeInfo(null);
       return;
     }
 
     let isMounted = true;
-    const delay = Math.random() * 600; // Small staggered delay to prevent TVMaze lookup rate-limits
+    const delay = Math.random() * 400; // Small staggered delay to prevent TVMaze lookup rate-limits
     const timeout = setTimeout(() => {
       fetchLiveTvMazeInfo(show.title).then((info) => {
-        if (isMounted && info && info.nextEpisode) {
-          setLiveAirstamp(info.nextEpisode.airstamp);
-          setLiveNextEpisode(info.nextEpisode);
+        if (isMounted && info) {
+          setTvMazeInfo(info);
+          if (info.outNowEpisode) {
+            setLiveAirstamp(info.outNowEpisode.airstamp || null);
+            setLiveNextEpisode(info.outNowEpisode);
+          } else if (info.nextEpisode) {
+            setLiveAirstamp(info.nextEpisode.airstamp || null);
+            setLiveNextEpisode(info.nextEpisode);
+          }
         }
       }).catch((err) => console.warn('ShowCard TVMaze fetch failed:', err));
     }, delay);
@@ -74,7 +80,7 @@ export default function ShowCard({
       isMounted = false;
       clearTimeout(timeout);
     };
-  }, [show.id, show.title, show.releaseDate, show.status]);
+  }, [show.id, show.title, show.releaseDate, show.status, show.type]);
 
   const handleToggleNotif = async (e: React.MouseEvent | React.TouchEvent) => {
     e.stopPropagation();
@@ -219,6 +225,7 @@ export default function ShowCard({
 
   // Visually display all Priority indicator types (🔴 High, 🟡 Medium, 🟢 Low, or custom)
   const priorityIndicator = getPriorityIndicator(show.priority, show.isWishlist);
+  const effectiveInfo = getEffectiveReleaseInfo(show, tvMazeInfo || liveAirstamp);
 
   return (
     <div
@@ -284,34 +291,24 @@ export default function ShowCard({
                 )}
               </div>
             )}
-            {(show.releaseDate || liveNextEpisode || liveAirstamp) && (
-              isShowOutNow(show) ? (
-                <span className="text-[9px] font-black uppercase tracking-wider px-2 py-0.5 rounded bg-emerald-500 text-black border border-emerald-400 shadow-md shrink-0 flex items-center gap-1 animate-pulse">
+            {(show.releaseDate || liveNextEpisode || liveAirstamp || show.nextAirDate || show.nextAirTimestamp || show.lastAirTimestamp || tvMazeInfo?.previousEpisode) && (
+              effectiveInfo.isOut ? (
+                <span className="text-[9px] font-black uppercase tracking-wider px-2 py-0.5 rounded bg-emerald-500 text-black border border-emerald-400 shadow-md shrink-0 flex items-center gap-1 animate-pulse font-sans">
                   🎉 OUT NOW!
                 </span>
-              ) : isReleaseDatePast(show.releaseDate) && !liveNextEpisode && !liveAirstamp ? null : (
-                <div className="flex items-center gap-1 pointer-events-auto">
-                  <span
-                    className="text-[9px] font-extrabold px-1.5 py-0.5 rounded bg-amber-400 text-black border border-amber-300 shadow-sm shrink-0 flex items-center gap-0.5"
-                    title={
-                      isReleaseDatePast(show.releaseDate) && liveNextEpisode
-                        ? `Next Episode: S${liveNextEpisode.season} E${liveNextEpisode.number} - ${liveNextEpisode.name} (${formatToDDMMYYYY(liveNextEpisode.airdate)})`
-                        : show.releaseDate
-                        ? `Release Date: ${formatToDDMMYYYY(show.releaseDate)}`
-                        : ''
-                    }
-                  >
-                    ⏰ {isReleaseDatePast(show.releaseDate) && liveNextEpisode?.airdate
-                      ? formatToDDMMYYYY(liveNextEpisode.airdate)
-                      : show.releaseDate 
-                        ? formatToDDMMYYYY(show.releaseDate) 
-                        : liveNextEpisode?.airdate
-                          ? formatToDDMMYYYY(liveNextEpisode.airdate)
-                          : liveAirstamp 
-                            ? formatToDDMMYYYY(new Date(liveAirstamp))
-                            : ''}
-                  </span>
-                </div>
+              ) : (effectiveInfo.isPastWindow && !effectiveInfo.isNextEpisode) ? null : (
+                <span
+                  className="text-[9px] font-extrabold px-1.5 py-0.5 rounded bg-amber-400 text-black border border-amber-300 shadow-md shrink-0 flex items-center gap-0.5 font-sans"
+                  title={
+                    effectiveInfo.isNextEpisode && liveNextEpisode
+                      ? `Next Episode: S${liveNextEpisode.season} E${liveNextEpisode.number} - ${liveNextEpisode.name} (${formatToDDMMYYYY(liveNextEpisode.airdate)})`
+                      : show.releaseDate
+                      ? `Release Date: ${formatToDDMMYYYY(show.releaseDate)}`
+                      : ''
+                  }
+                >
+                  ⏰ {effectiveInfo.label || effectiveInfo.formattedDateStr || ''}
+                </span>
               )
             )}
           </div>

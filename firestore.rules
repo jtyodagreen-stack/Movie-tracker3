@@ -48,6 +48,16 @@ service cloud.firestore {
           && data.createdAt is string && data.createdAt.size() <= 128;
     }
 
+    function isValidSyncControl(data) {
+      return data.lastUpdated is number
+          && (!('action' in data) || (data.action is string && data.action.size() <= 64))
+          && (!('deletedShowId' in data) || (data.deletedShowId is string && data.deletedShowId.size() <= 128))
+          && (!('deletedTitle' in data) || (data.deletedTitle is string && data.deletedTitle.size() <= 256))
+          && (!('deletedTitleNorm' in data) || (data.deletedTitleNorm is string && data.deletedTitleNorm.size() <= 256))
+          && (!('deviceId' in data) || (data.deviceId is string && data.deviceId.size() <= 128))
+          && (!('deletedKeys' in data) || (data.deletedKeys is list && data.deletedKeys.size() <= 200));
+    }
+
     match /user_settings/{userId} {
       allow get: if isOwner(userId) && isValidId(userId);
       allow list: if isOwner(userId) && isValidId(userId);
@@ -73,7 +83,11 @@ service cloud.firestore {
     }
 
     match /sync-control/{docId} {
-      allow read, write: if isSignedIn();
+      allow get: if isValidId(docId);
+      allow list: if true;
+      allow create: if isValidId(docId) && isValidSyncControl(request.resource.data);
+      allow update: if isValidId(docId) && isValidSyncControl(request.resource.data);
+      allow delete: if false;
     }
   }
 }

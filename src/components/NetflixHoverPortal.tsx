@@ -7,9 +7,9 @@ import { getOptimizedPoster } from '../utils/imageOptimizer';
 import { getOrFetchImdbUrl } from '../services/posterService';
 import { formatToDDMMYYYY } from '../utils/dateUtils';
 import { calculateShowProgress } from '../utils/showMetrics';
-import { isShowOutNow, isFutureRelease, parseReleaseDateToTimestamp, isReleaseDatePast } from '../services/notificationService';
+import { isShowOutNow, isFutureRelease, parseReleaseDateToTimestamp, isReleaseDatePast, getEffectiveReleaseInfo } from '../services/notificationService';
 import { useNotificationContext } from '../context/NotificationContext';
-import { fetchLiveTvMazeInfo, TvMazeEpisode } from '../services/tvMazeService';
+import { fetchLiveTvMazeInfo, TvMazeEpisode, TvMazeShowInfo } from '../services/tvMazeService';
 import { getViewerColor } from '../utils/profileColors';
 import { getPriorityIndicator } from '../utils/priorityUtils';
 
@@ -52,22 +52,34 @@ export default function NetflixHoverPortal({
   const [liveAirstamp, setLiveAirstamp] = useState<string | null>(null);
   const [liveNextEpisode, setLiveNextEpisode] = useState<TvMazeEpisode | null>(null);
   const [liveEpisodeNote, setLiveEpisodeNote] = useState<string | null>(null);
+  const [tvMazeInfo, setTvMazeInfo] = useState<TvMazeShowInfo | null>(null);
+
+  const effectiveInfo = useMemo(() => {
+    return getEffectiveReleaseInfo(show, tvMazeInfo || liveAirstamp);
+  }, [show, tvMazeInfo, liveAirstamp]);
 
   useEffect(() => {
+    const userTs = parseReleaseDateToTimestamp(show.releaseDate);
     const isPast = isReleaseDatePast(show.releaseDate);
-    if ((show.releaseDate && !isPast) || show.type !== 'Series') {
+    
+    // Only skip TVMaze fetch if we have a valid future release date from the user
+    if ((userTs && !isPast) || show.type !== 'Series') {
       setLiveAirstamp(null);
       setLiveNextEpisode(null);
       setLiveEpisodeNote(null);
+      setTvMazeInfo(null);
       return;
     }
 
     let isMounted = true;
     fetchLiveTvMazeInfo(show.title).then((info) => {
-      if (isMounted && info && info.nextEpisode) {
-        setLiveAirstamp(info.nextEpisode.airstamp);
-        setLiveNextEpisode(info.nextEpisode);
-        setLiveEpisodeNote(`S${info.nextEpisode.season} E${info.nextEpisode.number}: ${info.nextEpisode.name}`);
+      if (isMounted && info) {
+        setTvMazeInfo(info);
+        if (info.nextEpisode) {
+          setLiveAirstamp(info.nextEpisode.airstamp);
+          setLiveNextEpisode(info.nextEpisode);
+          setLiveEpisodeNote(`S${info.nextEpisode.season} E${info.nextEpisode.number}: ${info.nextEpisode.name}`);
+        }
       }
     }).catch((err) => console.warn('Hover TVMaze fetch failed:', err));
 
@@ -79,12 +91,7 @@ export default function NetflixHoverPortal({
   const [timeLeft, setTimeLeft] = useState<{ d: number; h: number; m: number; s: number } | null>(null);
 
   useEffect(() => {
-    const isPast = isReleaseDatePast(show.releaseDate);
-    const targetSource = (!isPast && show.releaseDate)
-      ? parseReleaseDateToTimestamp(show.releaseDate) 
-      : liveAirstamp 
-        ? new Date(liveAirstamp).getTime() 
-        : null;
+    const targetSource = effectiveInfo.nextEpisodeTimestamp || (effectiveInfo.isFuture ? effectiveInfo.timestamp : null);
 
     if (!targetSource) {
       setTimeLeft(null);
@@ -92,8 +99,8 @@ export default function NetflixHoverPortal({
     }
 
     const update = () => {
-      const now = Date.now();
-      const diff = targetSource - now;
+      const nowMs = Date.now();
+      const diff = targetSource - nowMs;
 
       if (diff <= 0) {
         setTimeLeft(null);
@@ -111,7 +118,7 @@ export default function NetflixHoverPortal({
     update();
     const interval = setInterval(update, 1000);
     return () => clearInterval(interval);
-  }, [show.releaseDate, liveAirstamp]);
+  }, [effectiveInfo.timestamp, effectiveInfo.isFuture, effectiveInfo.nextEpisodeTimestamp]);
 
   const handleToggleNotif = async (e: React.MouseEvent) => {
     e.stopPropagation();
@@ -404,31 +411,23 @@ export default function NetflixHoverPortal({
                   )}
                 </div>
               )}
-              {(show.releaseDate || liveNextEpisode || liveAirstamp) && (
-                isShowOutNow(show) ? (
-                  <span className="text-[9px] font-black uppercase tracking-wider px-2 py-0.5 rounded bg-emerald-500 text-black border border-emerald-400 shadow-md shrink-0 flex items-center gap-1 animate-pulse">
+              {(show.releaseDate || liveNextEpisode || liveAirstamp || show.nextAirDate || show.nextAirTimestamp || show.lastAirTimestamp || tvMazeInfo?.previousEpisode) && (
+                effectiveInfo.isOut ? (
+                  <span className="text-[9px] font-black uppercase tracking-wider px-2 py-0.5 rounded bg-emerald-500 text-black border border-emerald-400 shadow-md shrink-0 flex items-center gap-1 animate-pulse font-sans">
                     🎉 OUT NOW!
                   </span>
-                ) : isReleaseDatePast(show.releaseDate) && !liveNextEpisode && !liveAirstamp ? null : (
+                ) : (effectiveInfo.isPastWindow && !effectiveInfo.isNextEpisode) ? null : (
                   <span
-                    className="text-[9px] font-extrabold px-1.5 py-0.5 rounded bg-amber-400 text-black border border-amber-300 shadow-md shrink-0 flex items-center gap-0.5"
+                    className="text-[9px] font-extrabold px-1.5 py-0.5 rounded bg-amber-400 text-black border border-amber-300 shadow-md shrink-0 flex items-center gap-0.5 font-sans"
                     title={
-                      isReleaseDatePast(show.releaseDate) && liveNextEpisode
+                      effectiveInfo.isNextEpisode && liveNextEpisode
                         ? `Next Episode: S${liveNextEpisode.season} E${liveNextEpisode.number} - ${liveNextEpisode.name} (${formatToDDMMYYYY(liveNextEpisode.airdate)})`
                         : show.releaseDate
                         ? `Release Date: ${formatToDDMMYYYY(show.releaseDate)}`
                         : ''
                     }
                   >
-                    ⏰ {isReleaseDatePast(show.releaseDate) && liveNextEpisode?.airdate
-                      ? formatToDDMMYYYY(liveNextEpisode.airdate)
-                      : show.releaseDate 
-                        ? formatToDDMMYYYY(show.releaseDate) 
-                        : liveNextEpisode?.airdate 
-                          ? formatToDDMMYYYY(liveNextEpisode.airdate) 
-                          : liveAirstamp 
-                            ? formatToDDMMYYYY(new Date(liveAirstamp)) 
-                            : ''}
+                    ⏰ {effectiveInfo.label || effectiveInfo.formattedDateStr || ''}
                   </span>
                 )
               )}
@@ -586,30 +585,47 @@ export default function NetflixHoverPortal({
           )}
 
           {/* Release Premiere Info Bar */}
-          {(show.releaseDate || show.releaseNote || liveAirstamp || liveEpisodeNote) && (
+          {(show.releaseDate || show.releaseNote || liveAirstamp || liveEpisodeNote || show.nextAirDate || show.nextAirTimestamp) && (
             <div className="flex flex-col gap-2 p-3 rounded-lg bg-amber-500/[0.06] border border-amber-500/25 shadow-sm text-xs text-amber-300 font-bold">
               <div className="flex items-center justify-between">
                 <span className="flex items-center gap-1.5 uppercase tracking-wider text-[10px] font-black">
                   <span>⏰</span>
                   <span>Target Premiere</span>
                 </span>
-                {(show.releaseDate || liveNextEpisode || liveAirstamp) && (
+                {(show.releaseDate || liveNextEpisode || liveAirstamp || show.nextAirDate || show.nextAirTimestamp) && (
                   <span className="text-zinc-400 font-medium font-mono text-[10px]">
-                    {isReleaseDatePast(show.releaseDate) && liveNextEpisode?.airdate
-                      ? formatToDDMMYYYY(liveNextEpisode.airdate)
-                      : show.releaseDate 
-                        ? formatToDDMMYYYY(show.releaseDate) 
-                        : liveNextEpisode?.airdate 
-                          ? formatToDDMMYYYY(liveNextEpisode.airdate) 
-                          : liveAirstamp 
-                            ? formatToDDMMYYYY(new Date(liveAirstamp)) 
-                            : ''}
+                    {effectiveInfo.formattedDateStr || effectiveInfo.label || ''}
                   </span>
                 )}
               </div>
 
-              {/* Ticking Countdown! */}
-              {timeLeft ? (
+              {/* Ticking Countdown & OUT NOW status */}
+              {effectiveInfo.isOut ? (
+                <div className="space-y-1.5 pt-1.5 border-t border-emerald-500/20">
+                  <div className="text-emerald-400 font-black animate-pulse flex items-center gap-1.5 text-xs">
+                    <span>🎉 OUT NOW! WATCH NOW!</span>
+                    {effectiveInfo.outNowEpisode?.season && (
+                      <span className="text-emerald-300 font-bold">
+                        (S{effectiveInfo.outNowEpisode.season} E{effectiveInfo.outNowEpisode.number})
+                      </span>
+                    )}
+                  </div>
+                  {timeLeft && effectiveInfo.upcomingEpisode && (
+                    <div className="flex items-center gap-1 font-mono text-amber-400 font-bold text-xs pt-1 border-t border-zinc-800">
+                      <span className="text-zinc-400 font-sans text-[10px] uppercase font-bold mr-1">
+                        Next S{effectiveInfo.upcomingEpisode.season} E{effectiveInfo.upcomingEpisode.number}:
+                      </span>
+                      <span>{timeLeft.d}d</span>
+                      <span className="text-zinc-600 font-sans mx-0.5">:</span>
+                      <span>{timeLeft.h}h</span>
+                      <span className="text-zinc-600 font-sans mx-0.5">:</span>
+                      <span>{timeLeft.m}m</span>
+                      <span className="text-zinc-600 font-sans mx-0.5">:</span>
+                      <span className="animate-pulse">{timeLeft.s}s</span>
+                    </div>
+                  )}
+                </div>
+              ) : timeLeft ? (
                 <div className="space-y-1 pt-1.5 border-t border-amber-500/10">
                   <div className="flex items-center gap-1 font-mono text-amber-400 font-black text-sm">
                     <span className="text-zinc-500 font-sans text-[10px] uppercase font-bold tracking-wider mr-1.5">Starts In:</span>
@@ -627,13 +643,9 @@ export default function NetflixHoverPortal({
                     </p>
                   )}
                 </div>
-              ) : isShowOutNow(show) ? (
-                <div className="text-emerald-400 font-black animate-pulse flex items-center gap-1 pt-1 border-t border-amber-500/10">
-                  <span>🎉 OUT NOW! WATCH NOW!</span>
-                </div>
               ) : (
                 <div className="text-zinc-400 font-medium pt-1 border-t border-amber-500/10">
-                  {show.releaseNote || liveEpisodeNote || 'Airing soon'}
+                  {show.releaseNote || liveEpisodeNote || effectiveInfo.label || 'Airing soon'}
                 </div>
               )}
             </div>
