@@ -634,10 +634,16 @@ export async function fetchAllSheetDataBatch(
   try {
     const meta = await fetchSpreadsheetDetails(spreadsheetId, accessToken);
     resolvedConfigs = tabConfigs.map((t) => {
-      if (t.isWishlist || t.name.toLowerCase().includes('wishlist')) {
+      const lowerName = t.name.toLowerCase();
+      if (t.isWishlist || lowerName.includes('wishlist')) {
         const matched = findMatchingWishlistSheet(meta.sheetNames);
         if (matched) {
           return { ...t, name: matched };
+        }
+      } else if (lowerName.includes('showcase') || lowerName.includes('featured') || lowerName.includes('highlight')) {
+        const matchedShowcase = findMatchingShowcaseSheet(meta.sheetNames);
+        if (matchedShowcase) {
+          return { ...t, name: matchedShowcase };
         }
       } else {
         const matchedMaster = findMatchingMasterSheet(meta.sheetNames);
@@ -847,7 +853,10 @@ export function parseRawSheetRows(
     isWishlistTab ||
     sheetName.toLowerCase().includes('wishlist');
 
-  const isEffectiveShowcase = sheetName.toLowerCase().includes('showcase');
+  const isEffectiveShowcase =
+    sheetName.toLowerCase().includes('showcase') ||
+    sheetName.toLowerCase().includes('featured') ||
+    sheetName.toLowerCase().includes('highlight');
 
   // Positional fallbacks if any fields are unmapped
   if (isEffectiveWishlist) {

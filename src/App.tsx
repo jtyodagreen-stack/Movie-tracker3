@@ -2857,14 +2857,19 @@ export default function App() {
     return profileFilteredShows.filter((s) => s.isWishlist === false);
   }, [profileFilteredShows]);
 
+  // Featured billboard candidates list (Master only)
+  const featuredCandidates = useMemo(() => {
+    const list = masterFilteredShows.length > 0 ? masterFilteredShows : shows.filter((s) => s.isWishlist === false);
+    if (list.length === 0) return [];
+    const watchingList = list.filter((s) => s.status === '⏳ Watching');
+    return watchingList.length > 0 ? watchingList : list;
+  }, [masterFilteredShows, shows]);
+
   // Featured billboard show (Master only)
   const featuredShow = useMemo(() => {
-    const list = masterFilteredShows.length > 0 ? masterFilteredShows : shows.filter((s) => s.isWishlist === false);
-    if (list.length === 0) return null;
-    const watchingList = list.filter((s) => s.status === '⏳ Watching');
-    const candidates = watchingList.length > 0 ? watchingList : list;
-    return candidates[featuredIndex % candidates.length] || list[0];
-  }, [masterFilteredShows, shows, featuredIndex]);
+    if (featuredCandidates.length === 0) return null;
+    return featuredCandidates[featuredIndex % featuredCandidates.length] || null;
+  }, [featuredCandidates, featuredIndex]);
 
   // Auto-slideshow for Hero Billboard
   useEffect(() => {
@@ -3500,9 +3505,9 @@ export default function App() {
                 onOpenDetails={handleOpenDetails}
                 onIncrementEpisode={handleIncrementEpisode}
                 onSelectNextFeatured={() => setFeaturedIndex((prev) => prev + 1)}
-                onSelectPrevFeatured={() => setFeaturedIndex((prev) => (prev > 0 ? prev - 1 : Math.max(0, shows.length - 1)))}
-                itemCount={shows.filter((s) => s.status === '⏳ Watching').length > 0 ? shows.filter((s) => s.status === '⏳ Watching').length : shows.length}
-                currentIndex={featuredIndex}
+                onSelectPrevFeatured={() => setFeaturedIndex((prev) => (prev > 0 ? prev - 1 : Math.max(0, featuredCandidates.length - 1)))}
+                itemCount={featuredCandidates.length}
+                currentIndex={featuredCandidates.length > 0 ? featuredIndex % featuredCandidates.length : 0}
                 onSelectIndex={(idx) => setFeaturedIndex(idx)}
               />
             )}

@@ -559,7 +559,7 @@ export default function NetflixHoverPortal({
             <span className="text-zinc-300 font-semibold">{show.year}</span>
             <span aria-hidden="true" className="text-zinc-600">•</span>
             <span className="text-zinc-300 font-semibold">
-              {isMovie ? 'Movie' : `${formatS(show.seasons)} • ${formatE(show.episodes)}`}
+              {isMovie ? 'Movie' : 'Series'}
             </span>
           </div>
 
