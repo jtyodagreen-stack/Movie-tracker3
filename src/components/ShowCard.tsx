@@ -2,7 +2,7 @@ import { useState, useRef, useEffect } from 'react';
 import { Bell, BellRing, Sparkles } from 'lucide-react';
 import { ShowItem } from '../types';
 import { getOptimizedPoster } from '../utils/imageOptimizer';
-import { formatToDDMMYYYY } from '../utils/dateUtils';
+import { formatToDDMMYYYY, formatToLocalDisplay } from '../utils/dateUtils';
 import { calculateShowProgress } from '../utils/showMetrics';
 import { isNotificationEnabled, toggleShowNotification, isShowOutNow, isFutureRelease, isReleaseDatePast, getEffectiveReleaseInfo, parseReleaseDateToTimestamp } from '../services/notificationService';
 import { fetchLiveTvMazeInfo, TvMazeEpisode, TvMazeShowInfo } from '../services/tvMazeService';
@@ -301,9 +301,9 @@ export default function ShowCard({
                   className="text-[9px] font-extrabold px-1.5 py-0.5 rounded bg-amber-400 text-black border border-amber-300 shadow-md shrink-0 flex items-center gap-0.5 font-sans"
                   title={
                     effectiveInfo.isNextEpisode && liveNextEpisode
-                      ? `Next Episode: S${liveNextEpisode.season} E${liveNextEpisode.number} - ${liveNextEpisode.name} (${formatToDDMMYYYY(liveNextEpisode.airdate)})`
+                      ? `Next Episode: ${liveNextEpisode.name} (${formatToLocalDisplay(liveNextEpisode.airstamp || liveNextEpisode.airdate)})`
                       : show.releaseDate
-                      ? `Release Date: ${formatToDDMMYYYY(show.releaseDate)}`
+                      ? `Release Date: ${formatToLocalDisplay(show.releaseDate)}`
                       : ''
                   }
                 >

@@ -626,9 +626,9 @@ export default function ShowDetailModal({
                   className="text-[9px] font-extrabold px-1.5 py-0.5 rounded bg-amber-400 text-black border border-amber-300 shadow-md shrink-0 flex items-center gap-0.5"
                   title={
                     effectiveInfo.isNextEpisode && tvMazeInfo?.nextEpisode
-                      ? `Next Episode: S${tvMazeInfo.nextEpisode.season} E${tvMazeInfo.nextEpisode.number} - ${tvMazeInfo.nextEpisode.name} (${formatToDDMMYYYY(tvMazeInfo.nextEpisode.airdate)})`
+                      ? `Next Episode: ${tvMazeInfo.nextEpisode.name} (${formatToLocalDisplay(tvMazeInfo.nextEpisode.airstamp || tvMazeInfo.nextEpisode.airdate)})`
                       : (releaseDate || show.releaseDate)
-                      ? `Release Date: ${formatToDDMMYYYY(releaseDate || show.releaseDate)}`
+                      ? `Release Date: ${formatToLocalDisplay(releaseDate || show.releaseDate)}`
                       : ''
                   }
                 >

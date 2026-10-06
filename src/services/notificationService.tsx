@@ -680,9 +680,7 @@ export function getEffectiveReleaseInfo(
   // Do NOT roll to next episode until the 24 hours are COMPLETELY finished!
   if (isSeries && prevTs !== null && now >= prevTs && now < prevTs + TWENTY_FOUR_HOURS_MS) {
     const hasUpcoming = Boolean(upcomingFromNext?.timestamp && upcomingFromNext.timestamp > now);
-    const labelStr = outNowFromPrev?.season && outNowFromPrev?.number
-      ? `S${outNowFromPrev.season} E${outNowFromPrev.number}${outNowFromPrev.name ? ` • ${outNowFromPrev.name}` : ''}`
-      : formatToLocalDisplay(prevTs);
+    const labelStr = formatToLocalDisplay(prevTs);
 
     return {
       timestamp: hasUpcoming ? (upcomingFromNext!.timestamp || prevTs) : prevTs,
@@ -732,9 +730,7 @@ export function getEffectiveReleaseInfo(
       nextEpisodeTimestamp: nextTs,
       formattedDateStr: dateLabel,
       date: new Date(nextTs),
-      label: upcomingFromNext?.season && upcomingFromNext?.number
-        ? `${dateLabel} (S${upcomingFromNext.season} E${upcomingFromNext.number})`
-        : dateLabel,
+      label: dateLabel,
       isOut: false,
       isPastWindow: false,
       isFuture: true,
