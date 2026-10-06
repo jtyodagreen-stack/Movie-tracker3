@@ -383,7 +383,7 @@ export default function ShowCard({
               </span>
             )}
             <span className="text-[11px] text-zinc-500">
-              {show.type === 'Series' ? `${formatS(show.seasons)} • ${formatE(show.episodes)}` : 'Movie'}
+              {show.type === 'Series' ? 'Series' : 'Movie'}
             </span>
           </div>
         </div>

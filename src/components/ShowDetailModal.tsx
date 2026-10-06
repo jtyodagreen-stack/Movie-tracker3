@@ -873,22 +873,7 @@ export default function ShowDetailModal({
                 </select>
               </div>
 
-              {type === 'Series' && (
-                <div className="space-y-1.5 sm:text-right">
-                  <span className="text-xs font-bold text-zinc-400 uppercase tracking-widest block sm:mr-1">
-                    Current Progress
-                  </span>
-                  <div
-                    id="detail-current-progress-badge"
-                    className="inline-flex items-center gap-1.5 px-3 py-2 bg-zinc-800/90 border border-zinc-700 rounded-md font-mono text-white text-sm font-bold shadow-inner"
-                  >
-                    <span>{seasons}</span>
-                    <span className="text-zinc-500">•</span>
-                    <span>{episodes}</span>
-                    <span className="text-zinc-400 font-normal text-xs">of {maxEp}</span>
-                  </div>
-                </div>
-              )}
+              {/* Current Progress - Removed */}
             </div>
 
             {/* Steppers Grid & Progress Bar (Series only) */}

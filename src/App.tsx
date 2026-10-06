@@ -335,8 +335,6 @@ export default function App() {
   const [showStatsModal, setShowStatsModal] = useState(false);
   const [showDecisionWheelModal, setShowDecisionWheelModal] = useState(false);
   const [showScrollTop, setShowScrollTop] = useState(false);
-  const [showDiagnosticConsole, setShowDiagnosticConsole] = useState(false);
-  const [diagnosticQuery, setDiagnosticQuery] = useState('');
 
   const handleOpenSettingsModal = useCallback((
     tab: 'all' | 'user' | 'sync' | 'acc' | 'theme' | 'data' | 'help' | 'alerts' | 'stats' = 'sync',
@@ -2855,148 +2853,6 @@ export default function App() {
       selectedYear !== 'all'
   );
 
-  const activeDiagnosticList = useMemo(() => {
-    const logs: Record<string, any> = {};
-    const nowMs = Date.now();
-
-    const sheetMasterTitles = new Set(lastSyncSheetShowsRef.current.master.map((s) => normalizeTitleForComparison(s.title)).filter(Boolean));
-    const sheetWishlistTitles = new Set(lastSyncSheetShowsRef.current.wishlist.map((s) => normalizeTitleForComparison(s.title)).filter(Boolean));
-
-    const allKnownTitles = new Set([
-      ...shows.map((s) => s.title),
-      ...lastSyncSheetShowsRef.current.master.map((s) => s.title),
-      ...lastSyncSheetShowsRef.current.wishlist.map((s) => s.title)
-    ]);
-
-    allKnownTitles.forEach((title) => {
-      const norm = normalizeTitleForComparison(title);
-      if (!norm) return;
-
-      const s = shows.find((p) => normalizeTitleForComparison(p.title) === norm);
-      const onSheetMaster = sheetMasterTitles.has(norm);
-      const onSheetWishlist = sheetWishlistTitles.has(norm);
-
-      let filteredOut = !s;
-      let reason = s ? '✅ Passed all filters' : '❌ Discarded during sync (not in sheet or locked)';
-
-      if (s) {
-        // 1. Tombstone check
-        if (deletedShowKeysRef.current.has(s.id)) {
-          filteredOut = true;
-          reason = `❌ Deleted Tombstone ID matches: "${s.id}"`;
-        } else if (norm && deletedShowKeysRef.current.has(norm)) {
-          filteredOut = true;
-          reason = `❌ Legacy Tombstone Title match: "${norm}"`;
-        }
-        
-        // 2. Profile check
-        if (!filteredOut && activeProfile) {
-          const normActive = activeProfile.trim().toLowerCase();
-          if (s.who) {
-            const showWho = String(s.who).trim().toLowerCase();
-            const parts = showWho.split(/[&,\/]/).map((p) => p.trim());
-            if (showWho !== normActive && !showWho.includes(normActive) && !parts.includes(normActive)) {
-              filteredOut = true;
-              reason = `👤 Profile mismatch: show is for "${s.who}", active is "${activeProfile}"`;
-            }
-          } else {
-            filteredOut = true;
-            reason = `👤 Profile mismatch: show has no profile assigned, active is "${activeProfile}"`;
-          }
-        }
-
-        // 3. Search query check
-        if (!filteredOut && searchQuery.trim()) {
-          const query = searchQuery.trim().toLowerCase();
-          const t = (s.title || '').toLowerCase();
-          const g = (s.genre || '').toLowerCase();
-          const p = (s.platform || '').toLowerCase();
-          const n = (s.notes || '').toLowerCase();
-          const w = (s.who || '').toLowerCase();
-          const y = String(s.year || '').toLowerCase();
-          if (!t.includes(query) && !g.includes(query) && !p.includes(query) && !n.includes(query) && !w.includes(query) && !y.includes(query)) {
-            filteredOut = true;
-            reason = `🔍 Search query mismatch: does not match "${searchQuery}"`;
-          }
-        }
-
-        // 4. Category / Tab / Filter check
-        if (!filteredOut && activeFilter !== 'all' && activeFilter !== 'All Titles') {
-          if (activeFilter === '📋 Wishlist' || activeFilter === '📋  WISHLIST' || activeFilter === 'Wishlist') {
-            if (!s.isWishlist) {
-              filteredOut = true;
-              reason = `📂 Show is in Master tab, but active filter is Wishlist`;
-            }
-          } else if (activeFilter === '⏰ Coming Soon' || activeFilter === 'Coming Soon') {
-            if (!s.releaseDate && !s.releaseNote && !s.nextAirDate && !s.nextAirTimestamp) {
-              filteredOut = true;
-              reason = `⏰ Show has no premiere or countdown release date`;
-            }
-          } else if (activeFilter === '🎯 High-Priority Wishlist') {
-            const p = (s.priority || '').toLowerCase();
-            if (!s.isWishlist || (!p.includes('high') && !p.includes('🔴'))) {
-              filteredOut = true;
-              reason = `🎯 Show is not a high-priority Wishlist item`;
-            }
-          } else {
-            const statusMatch = s.status && String(s.status).toLowerCase().includes(activeFilter.toLowerCase().replace(/^[^\w\s]+/, '').trim());
-            if (!statusMatch) {
-              filteredOut = true;
-              reason = `🏷️ Status category mismatch: show is "${s.status}", active is "${activeFilter}"`;
-            }
-          }
-        }
-
-        // 5. Year check
-        if (!filteredOut && selectedYear !== 'all') {
-          if (s.year === undefined || s.year === null || String(s.year).trim() !== String(selectedYear).trim()) {
-            filteredOut = true;
-            reason = `📅 Year mismatch: show year is "${s.year}", active filter is "${selectedYear}"`;
-          }
-        }
-
-        // 6. Platform check
-        if (!filteredOut && selectedPlatform !== 'all') {
-          if (!s.platform) {
-            filteredOut = true;
-            reason = `📺 Platform mismatch: show has no platform, active filter is "${selectedPlatform}"`;
-          } else {
-            const normShow = normalizePlatform(s.platform);
-            const normSelected = normalizePlatform(selectedPlatform);
-            const match = normShow === normSelected || s.platform.trim() === selectedPlatform.trim() || s.platform.toLowerCase().includes(selectedPlatform.toLowerCase().replace(/^[^\w\s]+/, '').trim());
-            if (!match) {
-              filteredOut = true;
-              reason = `📺 Platform mismatch: show platform is "${s.platform}", active filter is "${selectedPlatform}"`;
-            }
-          }
-        }
-      } else {
-        // Why was it discarded?
-        if (deletedShowKeysRef.current.has(norm)) {
-          reason = `❌ Discarded: Matches deleted tombstone list`;
-        } else if (!onSheetMaster && !onSheetWishlist) {
-          reason = `❌ Discarded: Row does not exist on your Google Sheet Master or Wishlist tab`;
-        } else {
-          reason = `❌ Discarded: Resolved during sync or locked by local lockout`;
-        }
-      }
-
-      logs[norm] = {
-        title,
-        foundInMasterTab: onSheetMaster ? 'YES' : 'NO',
-        foundInWishlistTab: onSheetWishlist ? 'YES' : 'NO',
-        isWishlistFlag: s ? s.isWishlist : onSheetWishlist,
-        rowNumber: s ? s.rowNumber : undefined,
-        id: s ? s.id : 'none',
-        filteredOut,
-        reason,
-        timestamp: nowMs,
-      };
-    });
-
-    return Object.values(logs);
-  }, [shows, searchQuery, activeFilter, selectedPlatform, selectedYear, activeProfile]);
-
   const masterFilteredShows = useMemo(() => {
     return profileFilteredShows.filter((s) => s.isWishlist === false);
   }, [profileFilteredShows]);
@@ -3485,8 +3341,8 @@ export default function App() {
     }
 
     // State B: Google Sheet has been added, but they need to authenticate & sync
-    // ENHANCEMENT: If we have cached shows, or if currently syncing, we skip this screen to provide an "instant" experience.
-    if (!isSyncing && (!user || !sheetTitle) && shows.length === 0) {
+    // ENHANCEMENT: If user is signed in and we have content (or are currently syncing it), we skip this welcome screen entirely.
+    if (!user && !isSyncing && spreadsheetId && shows.length === 0) {
       return (
         <div className="max-w-xl mx-auto px-4 py-16 text-center space-y-6 animate-fadeIn">
           <div className="w-16 h-16 bg-amber-500/10 border border-amber-500/30 rounded-2xl flex items-center justify-center mx-auto text-amber-500 shadow-xl shadow-amber-950/20 animate-pulse">
@@ -3553,6 +3409,34 @@ export default function App() {
           </div>
         </div>
       );
+    }
+    
+    // Explicit tracker render check: skip welcome if syncing or library content exists
+    if (isSyncing || (user && shows.length > 0)) {
+        // Continue to tracker render
+    } else if (shows.length === 0 && !isSyncing) {
+        // Only show empty tracker state if we explicitly know it's empty
+        return (
+            <div className="max-w-md mx-auto px-4 py-20 text-center space-y-6">
+              <div className="w-16 h-16 bg-[#E50914]/10 border border-[#E50914]/30 rounded-full flex items-center justify-center mx-auto text-[#E50914] shadow-xl animate-pulse">
+                <Plus className="w-8 h-8" />
+              </div>
+              <div className="space-y-2">
+                <h3 className="text-xl font-bold text-white">Your Show Tracker is Empty</h3>
+                <p className="text-xs text-zinc-400 max-w-sm mx-auto leading-relaxed">
+                  You have successfully connected your Google Sheet! Now you can start adding movies and series to your personal list.
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowAddModal(true)}
+                className="inline-flex items-center gap-2 bg-[#E50914] hover:bg-[#B80710] text-white text-xs font-bold px-5 py-3 rounded-md shadow-lg shadow-red-900/30 transition-all uppercase tracking-wider cursor-pointer hover:scale-105"
+              >
+                <Plus className="w-4 h-4" />
+                Add Your First Show
+              </button>
+            </div>
+        );
     }
 
     if (showStatsModal && shows.length > 0) {
@@ -4594,109 +4478,6 @@ export default function App() {
         </div>
       </section>
 
-      {/* 📡 Live Diagnostics & Audit Console */}
-      <section className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 my-6">
-        <div className="bg-zinc-950 border border-zinc-800 rounded-2xl shadow-xl overflow-hidden">
-          <button
-            type="button"
-            onClick={() => setShowDiagnosticConsole(!showDiagnosticConsole)}
-            className="w-full flex items-center justify-between px-5 py-3.5 bg-zinc-900 hover:bg-zinc-850 transition-colors text-left focus:outline-none border-b border-zinc-850 cursor-pointer"
-          >
-            <div className="flex items-center gap-2">
-              <span className="text-sm">📡</span>
-              <div>
-                <strong className="text-white text-xs font-bold block">Live Sheet & Filter Diagnostics Console</strong>
-                <span className="text-[10px] text-zinc-500 font-normal">Real-time filter evaluation logs. Type any title to diagnose why it is displayed or hidden.</span>
-              </div>
-            </div>
-            <div className="flex items-center gap-2">
-              <span className="text-[10px] px-1.5 py-0.5 bg-zinc-800 rounded text-zinc-400 font-mono">
-                {activeDiagnosticList.length} titles evaluated
-              </span>
-              <span className="text-zinc-500 font-bold text-xs">{showDiagnosticConsole ? '▼ Collapse' : '▲ Expand'}</span>
-            </div>
-          </button>
-
-          {showDiagnosticConsole && (
-            <div className="p-5 space-y-4 max-h-[450px] overflow-y-auto">
-              <div className="flex items-center justify-between gap-3 flex-wrap">
-                <input
-                  type="text"
-                  placeholder="🔍 Type show title to diagnose... (e.g. Loki)"
-                  value={diagnosticQuery}
-                  onChange={(e) => setDiagnosticQuery(e.target.value)}
-                  className="bg-zinc-900 border border-zinc-750 rounded px-3 py-1.5 text-xs text-white placeholder-zinc-500 focus:outline-none focus:border-red-500 font-semibold w-full sm:max-w-xs"
-                />
-                <div className="flex items-center gap-2 text-[10px] text-zinc-400 font-mono">
-                  <span className="flex items-center gap-1"><span className="w-2.5 h-2.5 rounded-full bg-emerald-500"></span> Passed</span>
-                  <span className="flex items-center gap-1"><span className="w-2.5 h-2.5 rounded-full bg-red-500"></span> Filtered/Discarded</span>
-                </div>
-              </div>
-
-              <div className="space-y-2 font-sans">
-                {(() => {
-                  const filtered = activeDiagnosticList.filter((log) => {
-                    if (!diagnosticQuery.trim()) return true;
-                    return log.title.toLowerCase().includes(diagnosticQuery.trim().toLowerCase());
-                  });
-
-                  if (filtered.length === 0) {
-                    return (
-                      <p className="text-zinc-500 text-xs py-4 text-center">
-                        No titles match "{diagnosticQuery || 'your query'}" in current sync or memory.
-                      </p>
-                    );
-                  }
-
-                  return filtered.map((log) => (
-                    <div
-                      key={log.id + '-' + log.title}
-                      className={`p-3 rounded-lg border text-xs space-y-1.5 transition-all ${
-                        log.filteredOut
-                          ? 'bg-red-950/20 border-red-900/30 text-red-300'
-                          : 'bg-emerald-950/20 border-emerald-900/30 text-emerald-300'
-                      }`}
-                    >
-                      <div className="flex items-center justify-between gap-2 flex-wrap font-bold">
-                        <span className="text-white text-sm font-extrabold">{log.title}</span>
-                        <span className={`px-2 py-0.5 rounded text-[10px] uppercase font-bold ${
-                          log.filteredOut ? 'bg-red-500/10 text-red-400' : 'bg-emerald-500/10 text-emerald-400'
-                        }`}>
-                          {log.filteredOut ? '❌ Filtered Out / Discarded' : '✅ Active on Dashboard'}
-                        </span>
-                      </div>
-
-                      <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 text-[11px] text-zinc-300 font-sans">
-                        <div>
-                          <span className="text-zinc-500">Found in Master tab?</span>{' '}
-                          <strong className={log.foundInMasterTab === 'YES' ? 'text-emerald-400 font-bold' : 'text-zinc-500 font-bold'}>
-                            {log.foundInMasterTab}
-                          </strong>
-                        </div>
-                        <div>
-                          <span className="text-zinc-500">Found in Wishlist tab?</span>{' '}
-                          <strong className={log.foundInWishlistTab === 'YES' ? 'text-amber-400 font-bold' : 'text-zinc-500 font-bold'}>
-                            {log.foundInWishlistTab}
-                          </strong>
-                        </div>
-                        <div>
-                          <span className="text-zinc-500">isWishlist flag:</span>{' '}
-                          <strong className="text-zinc-400 font-mono">{String(log.isWishlistFlag)}</strong>
-                        </div>
-                      </div>
-
-                      <div className="text-[11px] bg-black/30 p-2 rounded border border-zinc-800/40 text-zinc-300 leading-relaxed font-mono">
-                        <span className="text-zinc-500 block text-[9px] uppercase font-mono tracking-wider mb-0.5">Evaluation Status Reason</span>
-                        {log.reason}
-                      </div>
-                    </div>
-                  ));
-                })()}
-              </div>
-            </div>
-          )}
-        </div>
-      </section>
 
       {/* Footer */}
       <footer className="border-t border-zinc-800/80 bg-[#101010] py-8 pb-28 sm:pb-8 text-zinc-500 text-xs mt-auto">

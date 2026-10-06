@@ -129,6 +129,7 @@ input[type="date"]::-webkit-calendar-picker-indicator {
   padding: 0 !important;
 }
 
+
 /* Custom keyframes for premium flashing "OUT NOW" countdown states */
 @keyframes outNowFlash {
   0%, 100% {
@@ -157,6 +158,15 @@ input[type="date"]::-webkit-calendar-picker-indicator {
 .animate-banner-out-now {
   animation: bannerOutNowFlash 2s infinite ease-in-out;
 }
+
+/* Added by user request: Hide user profile button and sheets status badge */
+div#root:nth-of-type(1) > div:nth-of-type(1) > header#main-navbar:nth-of-type(1) > div:nth-of-type(1) > div:nth-of-type(2) > div:nth-of-type(1) > div:nth-of-type(2) > button#user-profile-btn:nth-of-type(1) {
+    display: none !important;
+}
+div#root:nth-of-type(1) > div:nth-of-type(1) > header#main-navbar:nth-of-type(1) > div:nth-of-type(1) > div:nth-of-type(2) > div:nth-of-type(1) > button#nav-sheets-status-badge:nth-of-type(1) {
+    display: none !important;
+}
+
 
 /* High Contrast Mode - Rigorous WCAG AAA Compliance */
 .high-contrast {
