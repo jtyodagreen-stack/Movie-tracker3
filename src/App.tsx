@@ -3216,7 +3216,187 @@ export default function App() {
   );
 
   const renderMainContent = () => {
-    // State A: No Spreadsheet ID configured yet
+    // 1. If not signed in: Show unified Welcome page with both Sign-In button and Setup instructions
+    if (!user) {
+      const handleSaveSheetUrlNoAuth = async () => {
+        setWelcomeError('');
+        if (!welcomeSheetUrl.trim()) {
+          setWelcomeError('Please paste your Google Sheet URL first');
+          return;
+        }
+        const extractedId = extractSpreadsheetId(welcomeSheetUrl.trim());
+        if (!extractedId) {
+          setWelcomeError('Invalid Google Sheet URL. Please copy and paste the entire web address from your browser.');
+          return;
+        }
+        setSpreadsheetId(extractedId);
+        try {
+          localStorage.setItem('bingebox_spreadsheet_id', extractedId);
+        } catch {}
+        showToast('✅ Google Sheet URL saved! Now please sign in to sync.');
+      };
+
+      return (
+        <div className="max-w-2xl mx-auto px-4 py-8 sm:py-16 text-center space-y-6 animate-fadeIn">
+          <div className="w-16 h-16 bg-amber-500/10 border border-amber-500/30 rounded-2xl flex items-center justify-center mx-auto text-amber-500 shadow-xl shadow-amber-950/20 animate-pulse">
+            <Table className="w-8 h-8" />
+          </div>
+          <div className="space-y-2">
+            <h2 className="text-3xl font-extrabold text-white tracking-tight">
+              Welcome to SHOWFLIX
+            </h2>
+            <p className="text-sm text-zinc-400 max-w-md mx-auto leading-relaxed">
+              Track and synchronize your favorite movies and series directly with Google Sheets.
+            </p>
+          </div>
+
+          {/* Unified Sign-In Box */}
+          <div className="p-6 rounded-xl bg-zinc-900 border border-zinc-800 text-center space-y-5 shadow-2xl">
+            <div className="space-y-1.5">
+              <h3 className="text-lg font-bold text-white">Google Account Sign-In</h3>
+              <p className="text-xs text-zinc-400 leading-relaxed max-w-md mx-auto">
+                Sign in with Google to load your existing tracker from your spreadsheet automatically, or sync your new spreadsheet.
+              </p>
+            </div>
+
+            {spreadsheetId && (
+              <div className="p-3 bg-zinc-950 rounded border border-zinc-800 flex items-center justify-between text-xs text-left">
+                <div className="truncate pr-3">
+                  <span className="text-zinc-500 block text-[10px] uppercase">Active Spreadsheet URL</span>
+                  <span className="font-mono text-zinc-300 truncate block">https://docs.google.com/spreadsheets/d/{spreadsheetId}</span>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setSpreadsheetId('');
+                    setSheetTitle(undefined);
+                    setAvailableTabs([]);
+                    setShows([]);
+                    setWelcomeSheetUrl('');
+                    try {
+                      localStorage.removeItem('bingebox_spreadsheet_id');
+                      localStorage.removeItem('bingebox_sheet_title');
+                      localStorage.removeItem('bingebox_available_sheet_tabs');
+                      localStorage.removeItem('bingebox_app_data_cache');
+                    } catch {}
+                  }}
+                  className="text-red-400 hover:text-red-300 text-[11px] font-bold underline shrink-0 cursor-pointer"
+                >
+                  Change URL
+                </button>
+              </div>
+            )}
+
+            <button
+              type="button"
+              onClick={async () => {
+                showToast('🔑 Opening Google sign-in window...');
+                if (spreadsheetId) {
+                  await handleConnectSheets(spreadsheetId, sheetName, wishlistSheetName);
+                } else {
+                  // Connect with Google and try to auto-discover/restore the saved spreadsheetId
+                  const result = await handleSignIn();
+                  if (result?.user) {
+                    const cloudConfig = await loadUserSheetConfig(result.user.uid);
+                    if (cloudConfig?.spreadsheetId) {
+                      setSpreadsheetId(cloudConfig.spreadsheetId);
+                      localStorage.setItem('bingebox_spreadsheet_id', cloudConfig.spreadsheetId);
+                      showToast('✨ Welcome back! Your Google Sheet has been restored.');
+                      await handleConnectSheets(cloudConfig.spreadsheetId, cloudConfig.sheetName || 'MASTER TRACKER', cloudConfig.wishlistSheetName || '📋  WISHLIST');
+                    } else {
+                      showToast('✅ Account connected! Please enter your Sheet URL below to finish setup.');
+                    }
+                  }
+                }
+              }}
+              className="w-full bg-red-600 hover:bg-red-500 text-white font-extrabold py-3.5 px-4 rounded-lg shadow-lg hover:shadow-red-950/50 transition-all flex items-center justify-center gap-2 text-sm cursor-pointer uppercase tracking-wider"
+            >
+              <Table className="w-4 h-4" />
+              Sign In with Google
+            </button>
+          </div>
+
+          {/* Setup / URL Paste Box */}
+          <div className="p-5 rounded-xl bg-zinc-900/60 border border-zinc-800 text-left space-y-4 shadow-xl">
+            <h4 className="text-sm font-bold text-amber-400 flex items-center gap-2">
+              <Sparkles className="w-4 h-4" />
+              Setup a New Tracker / Connect Sheet URL
+            </h4>
+            
+            <div className="space-y-3 text-xs text-zinc-200 bg-zinc-950/60 p-4 rounded-lg border border-zinc-800">
+              <div className="flex items-start gap-2.5">
+                <span className="w-5 h-5 rounded-full bg-amber-500 text-black font-extrabold text-xs flex items-center justify-center shrink-0">1</span>
+                <div className="space-y-1.5 w-full">
+                  <strong className="text-amber-400 font-bold">Click to make a copy of the official Sheet template</strong>
+                  <p className="text-zinc-400 text-[11px] leading-relaxed">Get your copy of our official Google Sheets template in your Drive.</p>
+                  <div className="pt-1">
+                    <a
+                      href="https://docs.google.com/spreadsheets/d/1XWlhjlmRO3l85Ng_uVVGsAAApNiv469KGTRX0ZtpBBA/copy"
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="inline-flex items-center gap-2 bg-amber-500 hover:bg-amber-400 text-black text-[11px] font-black px-4 py-2 rounded shadow transition-all cursor-pointer no-underline uppercase"
+                    >
+                      <ExternalLink className="w-3.5 h-3.5" />
+                      1. Click to make a copy of the official Sheet template
+                    </a>
+                  </div>
+                </div>
+              </div>
+              
+              <div className="flex items-start gap-2.5 border-t border-zinc-800/80 pt-3">
+                <span className="w-5 h-5 rounded-full bg-amber-500 text-black font-extrabold text-xs flex items-center justify-center shrink-0">2</span>
+                <div className="space-y-2 w-full">
+                  <strong className="text-amber-400 font-bold">Connect your sheet URL</strong>
+                  <p className="text-zinc-400 text-[11px] leading-relaxed font-normal">Copy the spreadsheet URL from your browser address bar and paste it below:</p>
+                  
+                  <div className="flex flex-col sm:flex-row gap-2 mt-2">
+                    <input
+                      type="text"
+                      value={welcomeSheetUrl}
+                      onChange={(e) => setWelcomeSheetUrl(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') {
+                          e.preventDefault();
+                          handleSaveSheetUrlNoAuth();
+                        }
+                      }}
+                      placeholder="Paste Google Sheet URL (https://docs.google.com/spreadsheets/d/...)"
+                      className="flex-1 bg-zinc-950 border border-zinc-800 rounded px-3 py-2 text-xs text-white placeholder-zinc-500 focus:outline-none focus:border-amber-500 font-mono"
+                    />
+                    <button
+                      type="button"
+                      onClick={handleSaveSheetUrlNoAuth}
+                      className="bg-amber-500 hover:bg-amber-400 text-black font-bold text-xs px-4 py-2 rounded shrink-0 transition-colors cursor-pointer"
+                    >
+                      Save Sheet URL
+                    </button>
+                  </div>
+                  {welcomeError && (
+                    <p className="text-red-400 text-[11px] font-medium">{welcomeError}</p>
+                  )}
+                </div>
+              </div>
+
+              <div className="flex items-start gap-2.5 border-t border-zinc-800/80 pt-3">
+                <span className="w-5 h-5 rounded-full bg-amber-500 text-black font-extrabold text-xs flex items-center justify-center shrink-0">3</span>
+                <div>
+                  <strong className="text-amber-400 font-bold">Add profile names in the "Lists" tab</strong>
+                  <p className="text-zinc-400 text-[11px] mt-0.5 leading-relaxed">Open your Google Sheet, click the <span className="font-mono text-zinc-300">Lists</span> tab at the bottom, and enter your profile names in <strong>Column D</strong>. This adds your names as profiles you can select inside the app!</p>
+                </div>
+              </div>
+            </div>
+
+            <div className="pt-4 border-t border-zinc-800/40 text-center">
+              <span className="text-amber-400 font-bold text-xs md:text-sm inline-flex items-center gap-1.5 animate-pulse">
+                ✨ Set up and enjoy your new show tracker! ( Enjoy )
+              </span>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // 2. If signed in, but no spreadsheetId is set/loaded yet: Show Sheet URL setup page
     if (!spreadsheetId) {
       const handleSaveSheetUrl = async () => {
         setWelcomeError('');
@@ -3234,17 +3414,12 @@ export default function App() {
           localStorage.setItem('bingebox_spreadsheet_id', extractedId);
         } catch {}
 
-        // If user already authenticated, connect and load immediately with zero delay
-        if (user || auth.currentUser) {
-          showToast('⚡ Connecting Google Sheet...');
-          await handleConnectSheets(extractedId, sheetName, wishlistSheetName);
-        } else {
-          showToast('✅ Google Sheet added! Please sign in to sync your data.');
-        }
+        showToast('⚡ Connecting Google Sheet...');
+        await handleConnectSheets(extractedId, sheetName, wishlistSheetName);
       };
 
       return (
-        <div className="max-w-2xl mx-auto px-4 py-16 text-center space-y-6">
+        <div className="max-w-2xl mx-auto px-4 py-8 sm:py-16 text-center space-y-6 animate-fadeIn">
           <div className="w-16 h-16 bg-amber-500/10 border border-amber-500/30 rounded-2xl flex items-center justify-center mx-auto text-amber-500 shadow-xl shadow-amber-950/20 animate-pulse">
             <Table className="w-8 h-8" />
           </div>
@@ -3252,164 +3427,49 @@ export default function App() {
             <h2 className="text-3xl font-extrabold text-white tracking-tight">
               Welcome to SHOWFLIX
             </h2>
-            <p className="text-sm text-zinc-400 max-w-md mx-auto leading-relaxed">
-              First time use: Set up your tracker with our official layout template.
-            </p>
-          </div>
-
-          {/* Welcome Screen Instructions */}
-          <div className="p-5 rounded-xl bg-amber-500/10 border border-amber-500/30 text-left space-y-4 relative overflow-hidden shadow-2xl">
-            <div className="absolute top-0 right-0 p-4 opacity-10">
-              <Sparkles className="w-20 h-20 text-amber-500" />
-            </div>
-            <div className="relative z-10 space-y-3">
-              <h4 className="text-sm font-bold text-amber-400 flex items-center gap-2">
-                <Sparkles className="w-4 h-4" />
-                Setup Instructions
-              </h4>
-              <p className="text-xs text-zinc-300 leading-relaxed">
-                Follow these simple steps to configure your personal show tracker:
-              </p>
-              
-              <div className="space-y-3 text-xs text-zinc-200 bg-zinc-950/60 p-4 rounded-lg border border-zinc-800">
-                <div className="flex items-start gap-2.5">
-                  <span className="w-5 h-5 rounded-full bg-amber-500 text-black font-extrabold text-xs flex items-center justify-center shrink-0">1</span>
-                  <div className="space-y-1.5 w-full">
-                    <strong className="text-amber-400 font-bold">Click to make a copy of the official Sheet template</strong>
-                    <p className="text-zinc-400 text-[11px] leading-relaxed">Get your copy of our official Google Sheets template in your Drive.</p>
-                    <div className="pt-1">
-                      <a
-                        href="https://docs.google.com/spreadsheets/d/1XWlhjlmRO3l85Ng_uVVGsAAApNiv469KGTRX0ZtpBBA/copy"
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="inline-flex items-center gap-2 bg-amber-500 hover:bg-amber-400 text-black text-[11px] font-black px-4 py-2 rounded shadow transition-all cursor-pointer no-underline uppercase"
-                      >
-                        <ExternalLink className="w-3.5 h-3.5" />
-                        1. Click to make a copy of the official Sheet template
-                      </a>
-                    </div>
-                  </div>
-                </div>
-                
-                <div className="flex items-start gap-2.5 border-t border-zinc-800/80 pt-3">
-                  <span className="w-5 h-5 rounded-full bg-amber-500 text-black font-extrabold text-xs flex items-center justify-center shrink-0">2</span>
-                  <div className="space-y-2 w-full">
-                    <strong className="text-amber-400 font-bold">Connect your new sheet URL</strong>
-                    <p className="text-zinc-400 text-[11px] leading-relaxed font-normal">Copy the spreadsheet URL from your browser address bar and paste it below:</p>
-                    
-                    <div className="flex flex-col sm:flex-row gap-2 mt-2">
-                      <input
-                        type="text"
-                        value={welcomeSheetUrl}
-                        onChange={(e) => setWelcomeSheetUrl(e.target.value)}
-                        onKeyDown={(e) => {
-                          if (e.key === 'Enter') {
-                            e.preventDefault();
-                            handleSaveSheetUrl();
-                          }
-                        }}
-                        placeholder="Paste Google Sheet URL (https://docs.google.com/spreadsheets/d/...)"
-                        className="flex-1 bg-zinc-900 border border-zinc-700 rounded px-3 py-2 text-xs text-white placeholder-zinc-500 focus:outline-none focus:border-amber-500 font-mono"
-                      />
-                      <button
-                        type="button"
-                        onClick={handleSaveSheetUrl}
-                        className="bg-amber-500 hover:bg-amber-400 text-black font-bold text-xs px-4 py-2 rounded shrink-0 transition-colors cursor-pointer"
-                      >
-                        Save Sheet URL
-                      </button>
-                    </div>
-                    {welcomeError && (
-                      <p className="text-red-400 text-[11px] font-medium">{welcomeError}</p>
-                    )}
-                  </div>
-                </div>
-
-                <div className="flex items-start gap-2.5 border-t border-zinc-800/80 pt-3">
-                  <span className="w-5 h-5 rounded-full bg-amber-500 text-black font-extrabold text-xs flex items-center justify-center shrink-0">3</span>
-                  <div>
-                    <strong className="text-amber-400 font-bold">Add profile names in the "Lists" tab</strong>
-                    <p className="text-zinc-400 text-[11px] mt-0.5 leading-relaxed">Open your Google Sheet, click the <span className="font-mono text-zinc-300">Lists</span> tab at the bottom, and enter your profile names in <strong>Column D</strong>. This adds your names as profiles you can select inside the app!</p>
-                  </div>
-                </div>
-              </div>
-
-              <div className="pt-4 border-t border-zinc-800/40 text-center">
-                <span className="text-amber-400 font-bold text-xs md:text-sm inline-flex items-center gap-1.5 animate-pulse">
-                  ✨ Set up and enjoy your new show tracker! ( Enjoy )
-                </span>
-              </div>
-            </div>
-          </div>
-        </div>
-      );
-    }
-
-    // State B: Google Sheet has been added, but they need to authenticate & sync
-    // ENHANCEMENT: If user is signed in and we have content (or are currently syncing it), we skip this welcome screen entirely.
-    if (!user && !isSyncing && spreadsheetId && shows.length === 0) {
-      return (
-        <div className="max-w-xl mx-auto px-4 py-16 text-center space-y-6 animate-fadeIn">
-          <div className="w-16 h-16 bg-amber-500/10 border border-amber-500/30 rounded-2xl flex items-center justify-center mx-auto text-amber-500 shadow-xl shadow-amber-950/20 animate-pulse">
-            <Sparkles className="w-8 h-8" />
-          </div>
-          
-          <div className="space-y-2">
-            <h2 className="text-3xl font-extrabold text-white tracking-tight">
-              Welcome to SHOWFLIX
-            </h2>
             <p className="text-sm font-semibold max-w-md mx-auto leading-relaxed text-amber-400">
-              Connect Google Sheet Sync & Sign In with Google
+              Google Account Connected: {user.email || user.displayName}
+            </p>
+            <p className="text-xs text-zinc-400">
+              Please paste your Google Sheet URL below to finish the setup!
             </p>
           </div>
 
-          <div className="p-6 rounded-xl bg-zinc-900 border border-zinc-800 text-center space-y-5 shadow-2xl">
-            <p className="text-xs text-zinc-300 leading-relaxed">
-              You added your spreadsheet URL successfully! Now, please sign in with your Google account to authorize secure synchronization.
-            </p>
-
-            <div className="p-3 bg-zinc-950 rounded border border-zinc-800 flex items-center justify-between text-xs text-left">
-              <div className="truncate pr-3">
-                <span className="text-zinc-500 block text-[10px] uppercase">Active Spreadsheet URL</span>
-                <span className="font-mono text-zinc-300 truncate block">https://docs.google.com/spreadsheets/d/{spreadsheetId}</span>
+          <div className="p-5 rounded-xl bg-zinc-900 border border-zinc-800 text-left space-y-4 shadow-xl">
+            <div className="space-y-3 text-xs text-zinc-200 bg-zinc-950/60 p-4 rounded-lg border border-zinc-800">
+              <div className="flex items-start gap-2.5">
+                <span className="w-5 h-5 rounded-full bg-amber-500 text-black font-extrabold text-xs flex items-center justify-center shrink-0">1</span>
+                <div className="space-y-2 w-full">
+                  <strong className="text-amber-400 font-bold">Connect your sheet URL</strong>
+                  <p className="text-zinc-400 text-[11px] leading-relaxed font-normal">Paste your spreadsheet URL below:</p>
+                  
+                  <div className="flex flex-col sm:flex-row gap-2 mt-2">
+                    <input
+                      type="text"
+                      value={welcomeSheetUrl}
+                      onChange={(e) => setWelcomeSheetUrl(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') {
+                          e.preventDefault();
+                          handleSaveSheetUrl();
+                        }
+                      }}
+                      placeholder="Paste Google Sheet URL (https://docs.google.com/spreadsheets/d/...)"
+                      className="flex-1 bg-zinc-950 border border-zinc-800 rounded px-3 py-2 text-xs text-white placeholder-zinc-500 focus:outline-none focus:border-amber-500 font-mono"
+                    />
+                    <button
+                      type="button"
+                      onClick={handleSaveSheetUrl}
+                      className="bg-amber-500 hover:bg-amber-400 text-black font-bold text-xs px-4 py-2 rounded shrink-0 transition-colors cursor-pointer"
+                    >
+                      Connect Sheet
+                    </button>
+                  </div>
+                  {welcomeError && (
+                    <p className="text-red-400 text-[11px] font-medium">{welcomeError}</p>
+                  )}
+                </div>
               </div>
-              <button
-                type="button"
-                onClick={() => {
-                  setSpreadsheetId('');
-                  setSheetTitle(undefined);
-                  setAvailableTabs([]);
-                  setShows([]);
-                  setWelcomeSheetUrl('');
-                  try {
-                    localStorage.removeItem('bingebox_spreadsheet_id');
-                    localStorage.removeItem('bingebox_sheet_title');
-                    localStorage.removeItem('bingebox_available_sheet_tabs');
-                    localStorage.removeItem('bingebox_app_data_cache');
-                  } catch {}
-                }}
-                className="text-red-400 hover:text-red-300 text-[11px] font-bold underline shrink-0 cursor-pointer"
-              >
-                Change URL
-              </button>
-            </div>
-
-            <button
-              type="button"
-              onClick={async () => {
-                showToast('🔑 Opening Google sign-in window...');
-                await handleConnectSheets(spreadsheetId, sheetName, wishlistSheetName);
-              }}
-              className="w-full bg-red-600 hover:bg-red-500 text-white font-extrabold py-3.5 px-4 rounded-lg shadow-lg hover:shadow-red-950/50 transition-all flex items-center justify-center gap-2 text-sm cursor-pointer uppercase tracking-wider"
-            >
-              <Table className="w-4 h-4" />
-              Connect & Sign In with Google
-            </button>
-
-            <div className="pt-3 border-t border-zinc-800 text-center">
-              <span className="text-amber-400 font-bold text-xs inline-flex items-center gap-1.5 animate-pulse">
-                ✨ Almost ready to enjoy tracking and adding your shows! ( Enjoy )
-              </span>
             </div>
           </div>
         </div>
