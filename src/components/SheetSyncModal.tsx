@@ -159,8 +159,7 @@ export default function SheetSyncModal({
     setFetchingSheets(true);
 
     try {
-      const isActuallySignedIn = user && user.uid && user.uid !== 'user_default';
-      if (!isActuallySignedIn) {
+      if (!user) {
         await onSignIn();
       }
       // Connect to Google Sheets with token and tab names (only close on success)

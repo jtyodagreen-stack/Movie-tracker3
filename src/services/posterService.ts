@@ -235,10 +235,9 @@ async function searchOMDb(
     const data = await res.json();
     if (data && data.Response === 'True') {
       const detectedType: ShowType | undefined = data.Type === 'movie' ? 'Movie' : data.Type === 'series' ? 'Series' : undefined;
-      // Strictly ignore any non-movie/non-series (e.g. episode, game, person, etc.)
+      // Strictly ignore any non-movie/non-series (e.g. episode, game, person)
       if (!detectedType) return {};
-      // If a preferred type was requested, enforce strict match
-      if (preferredType && detectedType !== preferredType) return {};
+      if (!idMatch && preferredType && detectedType !== preferredType) return {};
 
       const posterUrl = data.Poster && data.Poster !== 'N/A' ? data.Poster : undefined;
       const synopsis = data.Plot && data.Plot !== 'N/A' ? data.Plot : undefined;
@@ -764,7 +763,7 @@ export async function searchLiveSuggestions(
 
   try {
     const imdbRes = await searchIMDb(trimmed, preferredType);
-    let items = imdbRes.liveItems.filter(item => item.type === 'Movie' || item.type === 'Series');
+    let items = imdbRes.liveItems;
     // Prioritize preferredType if specified, while retaining all matching Movies and Series
     if (preferredType) {
       items.sort((a, b) => {

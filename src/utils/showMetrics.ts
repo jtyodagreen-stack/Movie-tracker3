@@ -253,55 +253,35 @@ export function rebuildSheetAddedRanks(showList: ShowItem[]): ShowItem[] {
 export const ensureSortOrderNumbers = rebuildSheetAddedRanks;
 
 /**
- * Sort ONLY by highest score descending (highest = newest = first).
+ * Sort ONLY by highest score (time or addedRank) descending (highest = newest = first).
  * Ensures newly added or moved titles immediately appear at the top/front.
- * Evaluates the precise millisecond addition timestamp of each show first,
- * falling back to sheet dateAdded and rowNumber for 100% stable cross-sync ordering.
  */
 export function compareByAddedRank(a: ShowItem, b: ShowItem): number {
   if (a.id === b.id) return 0;
 
-  // Determine effective millisecond addition timestamp
-  const parseTime = (s: ShowItem) => {
-    const hasRow = typeof s.rowNumber === 'number' && !isNaN(s.rowNumber) && s.rowNumber > 0;
-    if (!hasRow) {
-      // Local unsynced show: trust precise millisecond timestamp
-      const rawTs = s.createdTimestamp || s.sessionAddedAt || s.addedTime;
-      if (typeof rawTs === 'number' && rawTs > 0) return rawTs;
-    } else {
-      // Synced sheet show: only trust preserved session/created timestamps
-      const rawTs = s.createdTimestamp || s.sessionAddedAt;
-      if (typeof rawTs === 'number' && rawTs > 0) return rawTs;
-    }
-    if (s.dateAdded) {
-      const parsed = parseAnyDate(s.dateAdded);
-      if (parsed) return parsed.getTime();
-    }
-    return 0;
-  };
+  const timeA = a.createdTimestamp || a.sessionAddedAt || a.addedTime || 0;
+  const timeB = b.createdTimestamp || b.sessionAddedAt || b.addedTime || 0;
 
-  const timeA = parseTime(a);
-  const timeB = parseTime(b);
+  const rankA = typeof a.addedRank === 'number' && !isNaN(a.addedRank)
+    ? a.addedRank
+    : (typeof a.sortOrderNum === 'number' && !isNaN(a.sortOrderNum) ? a.sortOrderNum : 0);
+  const rankB = typeof b.addedRank === 'number' && !isNaN(b.addedRank)
+    ? b.addedRank
+    : (typeof b.sortOrderNum === 'number' && !isNaN(b.sortOrderNum) ? b.sortOrderNum : 0);
 
-  // 1. Sort by timestamp descending if they differ
-  if (timeA !== timeB) {
-    return timeB - timeA;
+  const scoreA = Math.max(timeA, rankA);
+  const scoreB = Math.max(timeB, rankB);
+
+  if (scoreA !== scoreB) {
+    return scoreB - scoreA; // HIGHEST = NEWEST = TOP/FRONT
   }
 
-  // 2. Unsynced local titles with no row number should come before synced ones with row number
-  const hasRowA = typeof a.rowNumber === 'number' && !isNaN(a.rowNumber) && a.rowNumber > 0;
-  const hasRowB = typeof b.rowNumber === 'number' && !isNaN(b.rowNumber) && b.rowNumber > 0;
-  if (!hasRowA && hasRowB) return -1;
-  if (hasRowA && !hasRowB) return 1;
-
-  // 3. Fallback to Google Sheet row number descending (highest row number = appended later = more recent)
-  const rowA = a.rowNumber || 0;
-  const rowB = b.rowNumber || 0;
+  const rowA = typeof a.rowNumber === 'number' && !isNaN(a.rowNumber) ? a.rowNumber : 0;
+  const rowB = typeof b.rowNumber === 'number' && !isNaN(b.rowNumber) ? b.rowNumber : 0;
   if (rowA !== rowB) {
     return rowB - rowA;
   }
-
-  return b.id.localeCompare(a.id);
+  return 0;
 }
 
 export const compareRecentlyAdded = compareByAddedRank;

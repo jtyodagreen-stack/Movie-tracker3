@@ -2857,19 +2857,14 @@ export default function App() {
     return profileFilteredShows.filter((s) => s.isWishlist === false);
   }, [profileFilteredShows]);
 
-  // Featured billboard candidates list (Master only)
-  const featuredCandidates = useMemo(() => {
-    const list = masterFilteredShows.length > 0 ? masterFilteredShows : shows.filter((s) => s.isWishlist === false);
-    if (list.length === 0) return [];
-    const watchingList = list.filter((s) => s.status === '⏳ Watching');
-    return watchingList.length > 0 ? watchingList : list;
-  }, [masterFilteredShows, shows]);
-
   // Featured billboard show (Master only)
   const featuredShow = useMemo(() => {
-    if (featuredCandidates.length === 0) return null;
-    return featuredCandidates[featuredIndex % featuredCandidates.length] || null;
-  }, [featuredCandidates, featuredIndex]);
+    const list = masterFilteredShows.length > 0 ? masterFilteredShows : shows.filter((s) => s.isWishlist === false);
+    if (list.length === 0) return null;
+    const watchingList = list.filter((s) => s.status === '⏳ Watching');
+    const candidates = watchingList.length > 0 ? watchingList : list;
+    return candidates[featuredIndex % candidates.length] || list[0];
+  }, [masterFilteredShows, shows, featuredIndex]);
 
   // Auto-slideshow for Hero Billboard
   useEffect(() => {
@@ -3216,7 +3211,7 @@ export default function App() {
   );
 
   const renderMainContent = () => {
-    // State: No Spreadsheet ID configured yet
+    // State A: No Spreadsheet ID configured yet
     if (!spreadsheetId) {
       const handleSaveSheetUrl = async () => {
         setWelcomeError('');
@@ -3234,8 +3229,13 @@ export default function App() {
           localStorage.setItem('bingebox_spreadsheet_id', extractedId);
         } catch {}
 
-        showToast('⚡ Connecting Google Sheet...');
-        await handleConnectSheets(extractedId, sheetName, wishlistSheetName);
+        // If user already authenticated, connect and load immediately with zero delay
+        if (user || auth.currentUser) {
+          showToast('⚡ Connecting Google Sheet...');
+          await handleConnectSheets(extractedId, sheetName, wishlistSheetName);
+        } else {
+          showToast('✅ Google Sheet added! Please sign in to sync your data.');
+        }
       };
 
       return (
@@ -3311,7 +3311,7 @@ export default function App() {
                         onClick={handleSaveSheetUrl}
                         className="bg-amber-500 hover:bg-amber-400 text-black font-bold text-xs px-4 py-2 rounded shrink-0 transition-colors cursor-pointer"
                       >
-                        Connect &amp; Load Tracker
+                        Save Sheet URL
                       </button>
                     </div>
                     {welcomeError && (
@@ -3339,32 +3339,76 @@ export default function App() {
         </div>
       );
     }
-    // Explicit tracker render check: skip welcome if syncing or library content exists
-    if (isSyncing || (user && shows.length > 0)) {
-        // Continue to tracker render
-    } else if (shows.length === 0 && !isSyncing) {
-        // Only show empty tracker state if we explicitly know it's empty
-        return (
-            <div className="max-w-md mx-auto px-4 py-20 text-center space-y-6">
-              <div className="w-16 h-16 bg-[#E50914]/10 border border-[#E50914]/30 rounded-full flex items-center justify-center mx-auto text-[#E50914] shadow-xl animate-pulse">
-                <Plus className="w-8 h-8" />
-              </div>
-              <div className="space-y-2">
-                <h3 className="text-xl font-bold text-white">Your Show Tracker is Empty</h3>
-                <p className="text-xs text-zinc-400 max-w-sm mx-auto leading-relaxed">
-                  You have successfully connected your Google Sheet! Now you can start adding movies and series to your personal list.
-                </p>
+
+    // State B: Google Sheet has been added, but they need to authenticate & sync
+    // ENHANCEMENT: If we have cached shows, or if currently syncing, we skip this screen to provide an "instant" experience.
+    if (!isSyncing && (!user || !sheetTitle) && shows.length === 0) {
+      return (
+        <div className="max-w-xl mx-auto px-4 py-16 text-center space-y-6 animate-fadeIn">
+          <div className="w-16 h-16 bg-amber-500/10 border border-amber-500/30 rounded-2xl flex items-center justify-center mx-auto text-amber-500 shadow-xl shadow-amber-950/20 animate-pulse">
+            <Sparkles className="w-8 h-8" />
+          </div>
+          
+          <div className="space-y-2">
+            <h2 className="text-3xl font-extrabold text-white tracking-tight">
+              Welcome to SHOWFLIX
+            </h2>
+            <p className="text-sm font-semibold max-w-md mx-auto leading-relaxed text-amber-400">
+              Connect Google Sheet Sync & Sign In with Google
+            </p>
+          </div>
+
+          <div className="p-6 rounded-xl bg-zinc-900 border border-zinc-800 text-center space-y-5 shadow-2xl">
+            <p className="text-xs text-zinc-300 leading-relaxed">
+              You added your spreadsheet URL successfully! Now, please sign in with your Google account to authorize secure synchronization.
+            </p>
+
+            <div className="p-3 bg-zinc-950 rounded border border-zinc-800 flex items-center justify-between text-xs text-left">
+              <div className="truncate pr-3">
+                <span className="text-zinc-500 block text-[10px] uppercase">Active Spreadsheet URL</span>
+                <span className="font-mono text-zinc-300 truncate block">https://docs.google.com/spreadsheets/d/{spreadsheetId}</span>
               </div>
               <button
                 type="button"
-                onClick={() => setShowAddModal(true)}
-                className="inline-flex items-center gap-2 bg-[#E50914] hover:bg-[#B80710] text-white text-xs font-bold px-5 py-3 rounded-md shadow-lg shadow-red-900/30 transition-all uppercase tracking-wider cursor-pointer hover:scale-105"
+                onClick={() => {
+                  setSpreadsheetId('');
+                  setSheetTitle(undefined);
+                  setAvailableTabs([]);
+                  setShows([]);
+                  setWelcomeSheetUrl('');
+                  try {
+                    localStorage.removeItem('bingebox_spreadsheet_id');
+                    localStorage.removeItem('bingebox_sheet_title');
+                    localStorage.removeItem('bingebox_available_sheet_tabs');
+                    localStorage.removeItem('bingebox_app_data_cache');
+                  } catch {}
+                }}
+                className="text-red-400 hover:text-red-300 text-[11px] font-bold underline shrink-0 cursor-pointer"
               >
-                <Plus className="w-4 h-4" />
-                Add Your First Show
+                Change URL
               </button>
             </div>
-        );
+
+            <button
+              type="button"
+              onClick={async () => {
+                showToast('🔑 Opening Google sign-in window...');
+                await handleConnectSheets(spreadsheetId, sheetName, wishlistSheetName);
+              }}
+              className="w-full bg-red-600 hover:bg-red-500 text-white font-extrabold py-3.5 px-4 rounded-lg shadow-lg hover:shadow-red-950/50 transition-all flex items-center justify-center gap-2 text-sm cursor-pointer uppercase tracking-wider"
+            >
+              <Table className="w-4 h-4" />
+              Connect & Sign In with Google
+            </button>
+
+            <div className="pt-3 border-t border-zinc-800 text-center">
+              <span className="text-amber-400 font-bold text-xs inline-flex items-center gap-1.5 animate-pulse">
+                ✨ Almost ready to enjoy tracking and adding your shows! ( Enjoy )
+              </span>
+            </div>
+          </div>
+        </div>
+      );
     }
 
     if (showStatsModal && shows.length > 0) {
@@ -3428,9 +3472,9 @@ export default function App() {
                 onOpenDetails={handleOpenDetails}
                 onIncrementEpisode={handleIncrementEpisode}
                 onSelectNextFeatured={() => setFeaturedIndex((prev) => prev + 1)}
-                onSelectPrevFeatured={() => setFeaturedIndex((prev) => (prev > 0 ? prev - 1 : Math.max(0, featuredCandidates.length - 1)))}
-                itemCount={featuredCandidates.length}
-                currentIndex={featuredCandidates.length > 0 ? featuredIndex % featuredCandidates.length : 0}
+                onSelectPrevFeatured={() => setFeaturedIndex((prev) => (prev > 0 ? prev - 1 : Math.max(0, shows.length - 1)))}
+                itemCount={shows.filter((s) => s.status === '⏳ Watching').length > 0 ? shows.filter((s) => s.status === '⏳ Watching').length : shows.length}
+                currentIndex={featuredIndex}
                 onSelectIndex={(idx) => setFeaturedIndex(idx)}
               />
             )}

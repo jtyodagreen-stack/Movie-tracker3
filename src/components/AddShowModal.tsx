@@ -181,7 +181,6 @@ export default function AddShowModal({
   const [imdbId, setImdbId] = useState('');
   const [showManualUrlInput, setShowManualUrlInput] = useState(false);
   const searchTimeoutRef = useRef<NodeJS.Timeout | null>(null);
-  const isProgrammaticChangeRef = useRef(false);
 
   // TVMaze Live Tracker State
   const [tvMazeInfo, setTvMazeInfo] = useState<TvMazeShowInfo | null>(null);
@@ -264,12 +263,6 @@ export default function AddShowModal({
 
   // Auto-fetch poster, metadata, live suggestions, platform, and episode count as user types Title
   useEffect(() => {
-    // Skip recursive or redundant title searches when title gets filled programmatically
-    if (isProgrammaticChangeRef.current) {
-      isProgrammaticChangeRef.current = false;
-      return;
-    }
-
     const trimmedTitle = title.trim();
     if (!trimmedTitle || trimmedTitle.length < 2) {
       setIsFetchingPoster(false);
@@ -297,14 +290,6 @@ export default function AddShowModal({
     setIsFetchingPoster(true);
     setIsLoadingTvMaze(true);
     
-    let cleanTitle = title.trim();
-    const imdbMatch = cleanTitle.match(/(tt\d{5,10})/i);
-    const imdbIdFromUrl = imdbMatch ? imdbMatch[1] : '';
-
-    if (imdbIdFromUrl) {
-      setImdbId(imdbIdFromUrl);
-    }
-    
     // Clear notes & release countdown setup fields on new search
     setNotes('');
     setReleaseDate('');
@@ -314,12 +299,11 @@ export default function AddShowModal({
 
     searchTimeoutRef.current = setTimeout(async () => {
       try {
-        const query = imdbIdFromUrl || cleanTitle;
         // Fast parallel fetch: live IMDb/TVMaze suggestions, auto poster, and live TVMaze schedule
         const [suggestions, fetchRes, tvMazeSchedule] = await Promise.all([
-          searchLiveSuggestions(query, type),
-          autoFetchPoster(query, type, genre),
-          type === 'Series' ? fetchLiveTvMazeInfo(query) : Promise.resolve(null),
+          searchLiveSuggestions(trimmedTitle, type),
+          autoFetchPoster(trimmedTitle, type, genre),
+          type === 'Series' ? fetchLiveTvMazeInfo(trimmedTitle) : Promise.resolve(null),
         ]);
 
         setLiveSuggestions(suggestions);
@@ -328,13 +312,11 @@ export default function AddShowModal({
         setPosterCandidates(candidates);
         setTvMazeInfo(tvMazeSchedule);
 
-        if (result && result.matchedTitle && (query.includes('imdb.com') || query.match(/tt\d{5,10}/i))) {
-          isProgrammaticChangeRef.current = true;
+        if (result && result.matchedTitle && (trimmedTitle.includes('imdb.com') || trimmedTitle.match(/tt\d+/i))) {
           setTitle(result.matchedTitle);
-          setShowSuggestions(false);
         }
 
-        if (result && result.type && (query.includes('imdb.com') || query.match(/tt\d{5,10}/i))) {
+        if (result && result.type && (trimmedTitle.includes('imdb.com') || trimmedTitle.match(/tt\d+/i))) {
           setType(result.type);
           if (result.type === 'Movie') {
             setTvMazeInfo(null);
@@ -424,19 +406,11 @@ export default function AddShowModal({
     }
 
     const currentImdb = imdbId || posterResult?.imdbId;
-    const candYear = (year || detectedMetadata?.year || posterResult?.year || '').trim();
-
     const dupe = shows.find((s) => {
       if (currentImdb && s.imdbId && currentImdb.trim().toLowerCase() === s.imdbId.trim().toLowerCase()) return true;
       if (!s.title) return false;
       const cleanExisting = normalizeTitleForComparison(s.title);
-      if (cleanCand !== cleanExisting) return false;
-
-      // Allow same title but different release year
-      const existingYear = String(s.year || '').trim();
-      if (candYear && existingYear && candYear !== existingYear) return false;
-
-      return true;
+      return cleanExisting.length >= 2 && cleanCand === cleanExisting;
     });
 
     if (dupe) {
@@ -448,27 +422,20 @@ export default function AddShowModal({
       setDuplicateShowItem(null);
       setDuplicateError('');
     }
-  }, [title, imdbId, posterResult?.imdbId, shows, allowDuplicateOverride, year, detectedMetadata?.year, posterResult?.year]);
+  }, [title, imdbId, posterResult?.imdbId, shows, allowDuplicateOverride]);
 
   const handleSelectLiveSuggestion = (item: LiveSearchItem) => {
-    isProgrammaticChangeRef.current = true;
     setTitle(item.title);
     setType(item.type);
 
     // Check duplicate upon selecting suggestion
     const cleanCand = normalizeTitleForComparison(item.title);
     const currentImdb = item.imdbId;
-    const candYear = (item.year || '').trim();
     const dupe = cleanCand.length >= 2 ? shows.find((s) => {
       if (currentImdb && s.imdbId && currentImdb.trim().toLowerCase() === s.imdbId.trim().toLowerCase()) return true;
       if (!s.title) return false;
       const cleanExisting = normalizeTitleForComparison(s.title);
-      if (cleanCand !== cleanExisting) return false;
-
-      const existingYear = String(s.year || '').trim();
-      if (candYear && existingYear && candYear !== existingYear) return false;
-
-      return true;
+      return cleanExisting.length >= 2 && cleanCand === cleanExisting;
     }) : null;
 
     if (dupe && !allowDuplicateOverride) {
@@ -573,17 +540,11 @@ export default function AddShowModal({
     if (!bypassDuplicate && !allowDuplicateOverride) {
       const cleanCand = normalizeTitleForComparison(title);
       const currentImdb = imdbId || posterResult?.imdbId;
-      const candYear = (year || detectedMetadata?.year || posterResult?.year || '').trim();
       const dupe = cleanCand.length >= 2 ? shows.find((s) => {
         if (currentImdb && s.imdbId && currentImdb.trim().toLowerCase() === s.imdbId.trim().toLowerCase()) return true;
         if (!s.title) return false;
         const cleanExisting = normalizeTitleForComparison(s.title);
-        if (cleanCand !== cleanExisting) return false;
-
-        const existingYear = String(s.year || '').trim();
-        if (candYear && existingYear && candYear !== existingYear) return false;
-
-        return true;
+        return cleanExisting.length >= 2 && cleanCand === cleanExisting;
       }) : null;
 
       if (dupe) {
@@ -680,7 +641,6 @@ export default function AddShowModal({
     setDuplicateShowItem(null);
     setDuplicateError('');
     setAllowDuplicateOverride(false);
-    isProgrammaticChangeRef.current = false;
     onClose();
   };
 
